@@ -1,6 +1,6 @@
 # RSpace MCP server
 
-This is a proof-of-principle MCP server for RSpace that runs locally on your machine. It uses the [RSpace Python client](https://github.com/rspace-os/rspace-client-python) and exposes some RSpace API endpoints to LLM agents using the Model Context Protocol.
+This is a proof-of-concept MCP server for RSpace that runs locally on your machine. It uses the [RSpace Python client](https://github.com/rspace-os/rspace-client-python) and exposes some RSpace API endpoints to LLM agents using the Model Context Protocol.
 
 ## Installation and configuration
 
