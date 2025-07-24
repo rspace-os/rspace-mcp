@@ -1,3 +1,5 @@
 .idea/
 .env/
 .env
+*.lock
+.DS_Store
