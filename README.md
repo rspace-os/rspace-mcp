@@ -80,3 +80,6 @@ You can find descriptions of some usecases and examples in the [examples folder]
 ### Contributing new Tools
 If you develop new tools or toolsets, feel free to share code snippets or entire tool sets in the [tools folder](/tools) with appropriate annotations.
 
+## Acknowledgments
+
+This project is based on code originally created by [richarda23](https://github.com/richarda23).
