@@ -413,6 +413,87 @@ def download_file(
     resp = eln_cli.download_file(file_id=file_id, filename=file_path, chunk_size=1024)
     return resp
 
+@mcp.tool(tags={"rspace", "files"})
+def uploadAndAttachFile(
+    document_id: Union[int, str],
+    file_path: str,
+    caption: Optional[str] = None,
+    description: Optional[str] = None
+) -> dict:
+    """
+    Uploads a file to RSpace and attaches it to a document as a proper file attachment
+    
+    Usage: One-step process to upload any file and attach it to an RSpace document
+    File types: Supports all file types (images, PDFs, data files, protocols, etc.)
+    Attachment: Creates proper RSpace file attachment, not just a link
+    
+    Parameters:
+    - document_id: RSpace document ID (numeric or global ID like "SD12345")
+    - file_path: Path to the file to upload (e.g., "data/results.pdf")
+    - caption: Optional caption that appears with the attachment
+    - description: Optional description for the uploaded file
+    
+    Returns: Upload confirmation and document update information
+    """
+    try:
+        # Step 1: Upload the file to RSpace
+        with open(file_path, 'rb') as file:
+            upload_result = eln_cli.upload_file(file, caption=description)
+        
+        file_id = upload_result.get('id')
+        if not file_id:
+            return {"error": "File upload failed - no file ID returned"}
+        
+        # Step 2: Get the current document
+        document = eln_cli.get_document(document_id)
+        if not document.get('fields'):
+            return {"error": f"Document {document_id} has no fields to attach file to"}
+        
+        # Step 3: Create proper RSpace file attachment
+        # This is the key fix - use RSpace's native attachment format
+        attachment_html = f'<fileId={file_id}>'
+        
+        # Add caption as separate paragraph if provided
+        if caption:
+            attachment_html = f'<p><strong>{caption}</strong></p>\n{attachment_html}'
+        
+        # Step 4: Update the document with the file attachment
+        first_field = document['fields'][0]
+        current_content = first_field.get('content', '')
+        updated_content = current_content + '\n' + attachment_html
+        
+        # Update the document
+        update_result = eln_cli.update_document(
+            document_id=document_id,
+            fields=[{
+                'id': first_field['id'],
+                'content': updated_content
+            }]
+        )
+        
+        return {
+            "success": True,
+            "message": "File uploaded and attached successfully",
+            "file_info": {
+                "file_id": file_id,
+                "name": upload_result.get('name'),
+                "size": upload_result.get('size'),
+                "globalId": upload_result.get('globalId'),
+                "description": description
+            },
+            "attachment_info": {
+                "document_id": str(document_id),
+                "caption": caption,
+                "attachment_format": "rspace_native",
+                "field_updated": first_field['id']
+            },
+            "updated_document": update_result
+        }
+        
+    except FileNotFoundError:
+        return {"error": f"File not found: {file_path}"}
+    except Exception as e:
+        return {"error": f"Failed to upload and attach file: {str(e)}"}
 
 # ============================================================================
 # INVENTORY MANAGEMENT TOOLS
