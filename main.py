@@ -16,11 +16,12 @@ Extension Guide:
 - All tools should include comprehensive docstrings for Claude's understanding
 """
 
-from typing import Annotated, Dict, List, Optional, Union
+from typing import Annotated, Dict, List, Optional, Union, Literal
 
 from fastmcp import FastMCP
 from rspace_client.eln import eln as e  # Electronic Lab Notebook client
 from rspace_client.inv import inv as i  # Inventory Management client
+from rspace_client.eln.advanced_query_builder import AdvancedQueryBuilder
 import os
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -167,6 +168,240 @@ def update_document(
         fields=fields
     )
 
+
+@mcp.tool(tags={"rspace", "search"})
+def search_documents(
+    query: str,
+    search_type: Literal["simple", "advanced"] = "simple",
+    query_types: List[Literal["global", "fullText", "tag", "name", "created", "lastModified", "form", "attachment"]] = None,
+    operator: Literal["and", "or"] = "and",
+    order_by: str = "lastModified desc",
+    page_number: int = 0,
+    page_size: int = 20,
+    include_content: bool = False
+) -> dict:
+    """
+    Generic search tool for RSpace documents with flexible search options
+    
+    Usage: Search across all your RSpace documents using various criteria
+    
+    Parameters:
+    - query: The search term(s) to look for
+    - search_type: "simple" for basic search, "advanced" for multi-criteria search
+    - query_types: List of search types to use (for advanced search):
+        - "global": Search across all document content and metadata
+        - "fullText": Search within document text content
+        - "tag": Search by document tags
+        - "name": Search by document names/titles
+        - "created": Search by creation date (use ISO format like "2024-01-01")
+        - "lastModified": Search by modification date
+        - "form": Search by form type
+        - "attachment": Search by attachments
+    - operator: "and" (all criteria must match) or "or" (any criteria can match)
+    - order_by: Sort results by field (e.g., "lastModified desc", "name asc")
+    - page_number: Page number for pagination (0-based)
+    - page_size: Number of results per page (max 200)
+    - include_content: Whether to fetch full document content (slower but more complete)
+    
+    Returns: Dictionary with search results and metadata
+    
+    Examples:
+    - Simple text search: search_documents("PCR protocol")
+    - Search by tags: search_documents("experiment", search_type="advanced", query_types=["tag"])
+    - Multi-criteria search: search_documents("DNA", search_type="advanced", 
+                                            query_types=["fullText", "tag"], operator="or")
+    """
+    if page_size > 200:
+        raise ValueError("page_size must be 200 or less")
+    
+    if search_type == "simple":
+        # Use simple search - works like RSpace's "All" search
+        results = eln_cli.get_documents(
+            query=query,
+            order_by=order_by,
+            page_number=page_number,
+            page_size=page_size
+        )
+    else:
+        # Use advanced search with AdvancedQueryBuilder
+        if query_types is None:
+            query_types = ["global"]  # Default to global search
+        
+        builder = AdvancedQueryBuilder(operator=operator)
+        
+        # Add search terms for each specified query type
+        for query_type in query_types:
+            if query_type == "global":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.GLOBAL)
+            elif query_type == "fullText":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.FULL_TEXT)
+            elif query_type == "tag":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.TAG)
+            elif query_type == "name":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.NAME)
+            elif query_type == "created":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.CREATED)
+            elif query_type == "lastModified":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.LAST_MODIFIED)
+            elif query_type == "form":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.FORM)
+            elif query_type == "attachment":
+                builder.add_term(query, AdvancedQueryBuilder.QueryType.ATTACHMENT)
+        
+        advanced_query = builder.get_advanced_query()
+        results = eln_cli.get_documents_advanced_query(
+            advanced_query=advanced_query,
+            order_by=order_by,
+            page_number=page_number,
+            page_size=page_size
+        )
+    
+    # Optionally fetch full content for each document
+    if include_content and 'documents' in results:
+        for doc in results['documents']:
+            try:
+                full_doc = eln_cli.get_document(doc['globalId'])
+                # Add concatenated content to the document
+                content = ''
+                for field in full_doc.get('fields', []):
+                    content += field.get('content', '')
+                doc['fullContent'] = content
+            except Exception as e:
+                doc['fullContent'] = f"Error fetching content: {str(e)}"
+    
+    return results
+
+
+@mcp.tool(tags={"rspace", "search"})
+def search_by_tags(
+    tags: List[str],
+    operator: Literal["and", "or"] = "and",
+    order_by: str = "lastModified desc", 
+    page_number: int = 0,
+    page_size: int = 20
+) -> dict:
+    """
+    Search documents by specific tags
+    
+    Usage: Find documents tagged with specific keywords
+    
+    Parameters:
+    - tags: List of tags to search for
+    - operator: "and" (document must have all tags) or "or" (document can have any tag)
+    - order_by: Sort results by field
+    - page_number: Page number for pagination
+    - page_size: Number of results per page
+    
+    Returns: Dictionary with search results
+    
+    Example: search_by_tags(["PCR", "protocol"], operator="and")
+    """
+    builder = AdvancedQueryBuilder(operator=operator)
+    
+    for tag in tags:
+        builder.add_term(tag, AdvancedQueryBuilder.QueryType.TAG)
+    
+    advanced_query = builder.get_advanced_query()
+    return eln_cli.get_documents_advanced_query(
+        advanced_query=advanced_query,
+        order_by=order_by,
+        page_number=page_number,
+        page_size=page_size
+    )
+
+
+@mcp.tool(tags={"rspace", "search"})
+def search_recent_documents(
+    days_back: int = 7,
+    query: str = None,
+    page_size: int = 20
+) -> dict:
+    """
+    Search for recently modified documents
+    
+    Usage: Find documents modified within a specific timeframe
+    
+    Parameters:
+    - days_back: Number of days to look back
+    - query: Optional text search within recent documents
+    - page_size: Number of results to return
+    
+    Returns: Dictionary with recent documents
+    
+    Example: search_recent_documents(7, "experiment")
+    """
+    from datetime import datetime, timedelta
+    
+    # Calculate date range - RSpace expects "startDate;endDate" format for date ranges
+    start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    date_range = f"{start_date};{end_date}"
+    
+    builder = AdvancedQueryBuilder(operator="and")
+    builder.add_term(date_range, AdvancedQueryBuilder.QueryType.LAST_MODIFIED)
+    
+    if query:
+        builder.add_term(query, AdvancedQueryBuilder.QueryType.GLOBAL)
+    
+    advanced_query = builder.get_advanced_query()
+    return eln_cli.get_documents_advanced_query(
+        advanced_query=advanced_query,
+        order_by="lastModified desc",
+        page_number=0,
+        page_size=page_size
+    )
+
+
+@mcp.tool(tags={"rspace", "search"})
+def find_documents_by_content(
+    content_terms: List[str],
+    operator: Literal["and", "or"] = "and",
+    exclude_terms: List[str] = None,
+    order_by: str = "lastModified desc",
+    page_size: int = 20
+) -> dict:
+    """
+    Advanced content-based document search
+    
+    Usage: Find documents containing specific content terms
+    
+    Parameters:
+    - content_terms: List of terms that should appear in document content
+    - operator: "and" (all terms must appear) or "or" (any term can appear)
+    - exclude_terms: Optional list of terms to exclude from results
+    - order_by: Sort results by field
+    - page_size: Number of results to return
+    
+    Returns: Dictionary with search results
+    
+    Example: find_documents_by_content(["DNA", "extraction"], operator="and")
+    """
+    builder = AdvancedQueryBuilder(operator=operator)
+    
+    for term in content_terms:
+        builder.add_term(term, AdvancedQueryBuilder.QueryType.FULL_TEXT)
+    
+    # Note: RSpace API doesn't directly support exclusion, but we can filter results
+    advanced_query = builder.get_advanced_query()
+    results = eln_cli.get_documents_advanced_query(
+        advanced_query=advanced_query,
+        order_by=order_by,
+        page_number=0,
+        page_size=page_size
+    )
+    
+    # Filter out documents containing excluded terms if specified
+    if exclude_terms and 'documents' in results:
+        filtered_docs = []
+        for doc in results['documents']:
+            # Check if any exclude terms are in the document name or other available text
+            doc_text = (doc.get('name', '') + ' ' + doc.get('tags', '')).lower()
+            if not any(exclude_term.lower() in doc_text for exclude_term in exclude_terms):
+                filtered_docs.append(doc)
+        results['documents'] = filtered_docs
+        results['totalHits'] = len(filtered_docs)
+    
+    return results
 
 # ==================== NOTEBOOK OPERATIONS ====================
 # Specialized tools for notebook creation and entry management
