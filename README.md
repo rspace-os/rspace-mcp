@@ -2,6 +2,10 @@
 
 This is a proof-of-concept MCP server for RSpace that runs locally on your machine. It uses the [RSpace Python client](https://github.com/rspace-os/rspace-client-python) and exposes some RSpace API endpoints to LLM agents using the Model Context Protocol.
 
+<a href="https://glama.ai/mcp/servers/@rspace-os/rspace-mcp">
+  <img width="380" height="200" src="https://glama.ai/mcp/servers/@rspace-os/rspace-mcp/badge" alt="RSpace Server MCP server" />
+</a>
+
 ## Installation and configuration
 
 1. Clone or download this repository to your local machine
