@@ -53,7 +53,7 @@ This is a proof-of-concept MCP server for RSpace that runs locally on your machi
         {
           "mcpServers": {
             "rspace": {
-              "command": "/Users/tilomathes/.local/bin/uv",
+              "command": "<path to uv command>",
               "args": [
                 "--directory",
                 "<full path to this directory>",
