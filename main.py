@@ -16,7 +16,7 @@ Extension Guide:
 - All tools should include comprehensive docstrings for Claude's understanding
 """
 
-from typing import Annotated, Dict, List, Optional, Union, Literal
+from typing import Annotated, Any, Dict, List, Optional, Union, Literal
 
 from fastmcp import FastMCP
 from rspace_client.eln import eln as e  # Electronic Lab Notebook client
@@ -779,6 +779,7 @@ def create_sample(
 def create_sample_from_template(
     template_id: Union[int, str],
     name: str,
+    fields: Dict[str, Any] = None,
     tags: List[str] = None,
     description: str = None,
     subsample_count: int = 1,
@@ -790,12 +791,65 @@ def create_sample_from_template(
 
     Usage: Use when a sample template defines the required fields, units, and structure.
     Template: Specify the numeric ID or global ID (e.g., "ST12") of the template to use.
-    Fields: The new sample will inherit the template's custom fields; field values can be
-            updated after creation using the relevant update tools.
+
+    Fields: Pass a dict mapping field names to values for template-defined fields,
+            e.g. {"Concentration": "5", "Purity": "99%"}.
+            Before calling this tool, use get_sample_template to inspect the template
+            and discover which fields exist and which are mandatory.
+            If any mandatory fields are missing from 'fields', this tool will return
+            an error listing the missing fields (with their types) instead of creating
+            the sample — re-call with those fields populated.
+
     Quantity: Tracks total amount with specified units (ml, mg, μl, etc.).
 
     Returns: Created sample information including generated subsample IDs.
     """
+    # Fetch the template to validate mandatory fields
+    template = inv_cli.get_sample_template_by_id(template_id)
+    template_fields = template.get("fields", [])
+
+    # Build a set of field names the caller supplied (normalised to lowercase for comparison)
+    supplied = {k.lower(): v for k, v in (fields or {}).items()}
+
+    missing_mandatory = [
+        {"name": f["name"], "type": f.get("type", "unknown")}
+        for f in template_fields
+        if f.get("mandatory") and f["name"].lower() not in supplied
+    ]
+
+    if missing_mandatory:
+        return {
+            "error": "mandatory_fields_missing",
+            "message": (
+                "The template has mandatory fields that must be supplied. "
+                "Re-call create_sample_from_template with these fields included in 'fields'."
+            ),
+            "missing_mandatory_fields": missing_mandatory,
+            "all_template_fields": [
+                {
+                    "name": f["name"],
+                    "type": f.get("type", "unknown"),
+                    "mandatory": f.get("mandatory", False),
+                }
+                for f in template_fields
+            ],
+        }
+
+    # Convert caller-supplied fields dict into the list format the SDK expects,
+    # matching against the template field definitions to pick up the field id.
+    fields_payload = None
+    if fields:
+        template_field_by_name = {f["name"].lower(): f for f in template_fields}
+        fields_payload = []
+        for field_name, value in fields.items():
+            tf = template_field_by_name.get(field_name.lower())
+            entry = {"content": str(value)}
+            if tf and "id" in tf:
+                entry["id"] = tf["id"]
+            else:
+                entry["name"] = field_name
+            fields_payload.append(entry)
+
     tag_objects = i.gen_tags(tags) if tags else []
 
     quantity = None
@@ -809,6 +863,7 @@ def create_sample_from_template(
         tags=tag_objects,
         description=description,
         sample_template_id=template_id,
+        fields=fields_payload,
         subsample_count=subsample_count,
         total_quantity=quantity
     )
