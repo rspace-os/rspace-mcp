@@ -777,7 +777,7 @@ def create_sample(
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
 def create_sample_from_template(
-    template_id: Union[int, str],
+    template_id: str,
     name: str,
     fields: Dict[str, Any] = None,
     tags: List[str] = None,
@@ -790,7 +790,10 @@ def create_sample_from_template(
     Creates a new sample based on an existing sample template.
 
     Usage: Use when a sample template defines the required fields, units, and structure.
-    Template: Specify the numeric ID or global ID (e.g., "ST12") of the template to use.
+    Template ID: Must be the global ID with the "IT" prefix, e.g. "IT12".
+                 Use list_sample_templates to discover available templates and their global IDs.
+                 Using the full global ID (not just the numeric part) avoids ambiguity with
+                 other resource types.
 
     Fields: Pass a dict mapping field names to values for template-defined fields,
             e.g. {"Concentration": "5", "Purity": "99%"}.
@@ -804,6 +807,15 @@ def create_sample_from_template(
 
     Returns: Created sample information including generated subsample IDs.
     """
+    if not str(template_id).upper().startswith("IT"):
+        return {
+            "error": "invalid_template_id",
+            "message": (
+                f"template_id must be a global ID with the 'IT' prefix, e.g. 'IT{template_id}'. "
+                "Use list_sample_templates to find the correct global ID."
+            ),
+        }
+
     # Fetch the template to validate mandatory fields
     template = inv_cli.get_sample_template_by_id(template_id)
     template_fields = template.get("fields", [])
@@ -1185,11 +1197,15 @@ def create_sample_template(template_data: dict) -> dict:
 
 
 @mcp.tool(tags={"rspace", "inventory", "templates"})
-def get_sample_template(template_id: Union[int, str]) -> dict:
+def get_sample_template(template_id: str) -> dict:
     """
     Retrieves detailed information about a sample template
-    
-    Usage: Examine template structure before using for sample creation
+
+    Usage: Examine template structure before using for sample creation.
+           Call this before create_sample_from_template to discover available
+           fields, their types, and which are mandatory.
+    Template ID: Use the global ID with the "IT" prefix, e.g. "IT12".
+                 Use list_sample_templates to find global IDs.
     Returns: Complete template definition including field specifications
     """
     return inv_cli.get_sample_template_by_id(template_id)
