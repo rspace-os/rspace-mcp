@@ -776,6 +776,45 @@ def create_sample(
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
+def create_sample_from_template(
+    template_id: Union[int, str],
+    name: str,
+    tags: List[str] = None,
+    description: str = None,
+    subsample_count: int = 1,
+    total_quantity_value: float = None,
+    total_quantity_unit: str = "ml"
+) -> dict:
+    """
+    Creates a new sample based on an existing sample template.
+
+    Usage: Use when a sample template defines the required fields, units, and structure.
+    Template: Specify the numeric ID or global ID (e.g., "ST12") of the template to use.
+    Fields: The new sample will inherit the template's custom fields; field values can be
+            updated after creation using the relevant update tools.
+    Quantity: Tracks total amount with specified units (ml, mg, μl, etc.).
+
+    Returns: Created sample information including generated subsample IDs.
+    """
+    tag_objects = i.gen_tags(tags) if tags else []
+
+    quantity = None
+    if total_quantity_value:
+        from rspace_client.inv import quantity_unit as qu
+        unit = qu.QuantityUnit.of(total_quantity_unit)
+        quantity = i.Quantity(total_quantity_value, unit)
+
+    return inv_cli.create_sample(
+        name=name,
+        tags=tag_objects,
+        description=description,
+        sample_template_id=template_id,
+        subsample_count=subsample_count,
+        total_quantity=quantity
+    )
+
+
+@mcp.tool(tags={"rspace", "inventory", "samples"})
 def get_sample(sample_id: Union[int, str]) -> dict:
     """
     Retrieves complete information about a specific sample
