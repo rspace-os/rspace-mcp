@@ -816,6 +816,10 @@ def create_sample_from_template(
             ),
         }
 
+    # Extract the numeric part for the POST body — the API expects a plain integer
+    # for templateId, but get_sample_template_by_id handles the full global ID fine.
+    numeric_template_id = int(str(template_id)[2:])
+
     # Fetch the template to validate mandatory fields
     template = inv_cli.get_sample_template_by_id(template_id)
     template_fields = template.get("fields", [])
@@ -874,7 +878,7 @@ def create_sample_from_template(
         name=name,
         tags=tag_objects,
         description=description,
-        sample_template_id=template_id,
+        sample_template_id=numeric_template_id,
         fields=fields_payload,
         subsample_count=subsample_count,
         total_quantity=quantity
