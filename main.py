@@ -800,6 +800,9 @@ def create_sample_from_template(
               - String/Text/Number/Date/Time: plain value, e.g. {"Concentration": "5"}
               - Radio: single string matching one of the allowed options, e.g. {"Source": "Commercial"}
               - Choice: a list of strings matching allowed options, e.g. {"Supplier": ["NEB", "Sigma"]}
+            You only need to supply fields you want to set — the tool automatically sends
+            all other template fields as blank so the API accepts the request (the API
+            rejects payloads that omit any template field, even optional ones).
             Before calling this tool, use get_sample_template to inspect the template
             and discover which fields exist, their types, allowed options, and which are mandatory.
             If any mandatory fields are missing from 'fields', this tool will return
@@ -823,11 +826,11 @@ def create_sample_from_template(
     # for templateId, but get_sample_template_by_id handles the full global ID fine.
     numeric_template_id = int(str(template_id)[2:])
 
-    # Fetch the template to validate mandatory fields
+    # Fetch the template to validate mandatory fields and build the full field list
     template = inv_cli.get_sample_template_by_id(template_id)
     template_fields = template.get("fields", [])
 
-    # Build a set of field names the caller supplied (normalised to lowercase for comparison)
+    # Normalise caller-supplied field names to lowercase for case-insensitive matching
     supplied = {k.lower(): v for k, v in (fields or {}).items()}
 
     missing_mandatory = [
@@ -854,32 +857,32 @@ def create_sample_from_template(
             ],
         }
 
-    # Convert caller-supplied fields dict into the list format the SDK expects,
-    # matching against the template field definitions to pick up the field id and type.
-    # Radio  -> {"selectedOptions": [value]}       (single selection, wrapped in list)
-    # Choice -> {"selectedOptions": value}          (multi-selection, value must be a list)
-    # All other types -> {"content": str(value)}
-    fields_payload = None
-    if fields:
-        template_field_by_name = {f["name"].lower(): f for f in template_fields}
-        fields_payload = []
-        for field_name, value in fields.items():
-            tf = template_field_by_name.get(field_name.lower())
-            field_type = (tf.get("type", "") if tf else "").lower()
-
+    # Build the full fields payload in template order.
+    # The API requires every template field to be present — omitting even optional/blank
+    # fields (e.g. empty date fields) causes a rejection. Fields the caller didn't supply
+    # are sent as {} (or {"id": ...}), satisfying the API while leaving the value blank.
+    #
+    # Value serialisation by field type:
+    #   Radio  -> {"selectedOptions": [value]}   single selection, wrapped in list
+    #   Choice -> {"selectedOptions": value}      multi-selection; single string auto-wrapped
+    #   Date/Time/String/Number/… -> {"content": str(value)}
+    fields_payload = []
+    for tf in template_fields:
+        entry = {}
+        if "id" in tf:
+            entry["id"] = tf["id"]
+        value = supplied.get(tf["name"].lower())
+        if value is not None:
+            field_type = tf.get("type", "").lower()
             if field_type == "radio":
-                entry = {"selectedOptions": [str(value)]}
+                entry["selectedOptions"] = [str(value)]
             elif field_type == "choice":
-                # Accept either a list or a single string for convenience
-                entry = {"selectedOptions": value if isinstance(value, list) else [str(value)]}
+                entry["selectedOptions"] = value if isinstance(value, list) else [str(value)]
             else:
-                entry = {"content": str(value)}
-
-            if tf and "id" in tf:
-                entry["id"] = tf["id"]
-            else:
-                entry["name"] = field_name
-            fields_payload.append(entry)
+                entry["content"] = str(value)
+        # If value is None, entry stays as {} (or {"id": ...}), satisfying the API's
+        # requirement that all fields are present while leaving the value blank.
+        fields_payload.append(entry)
 
     tag_objects = i.gen_tags(tags) if tags else []
 
