@@ -795,10 +795,13 @@ def create_sample_from_template(
                  Using the full global ID (not just the numeric part) avoids ambiguity with
                  other resource types.
 
-    Fields: Pass a dict mapping field names to values for template-defined fields,
-            e.g. {"Concentration": "5", "Purity": "99%"}.
+    Fields: Pass a dict mapping field names to values for template-defined fields.
+            Value format depends on field type:
+              - String/Text/Number/Date/Time: plain value, e.g. {"Concentration": "5"}
+              - Radio: single string matching one of the allowed options, e.g. {"Source": "Commercial"}
+              - Choice: a list of strings matching allowed options, e.g. {"Supplier": ["NEB", "Sigma"]}
             Before calling this tool, use get_sample_template to inspect the template
-            and discover which fields exist and which are mandatory.
+            and discover which fields exist, their types, allowed options, and which are mandatory.
             If any mandatory fields are missing from 'fields', this tool will return
             an error listing the missing fields (with their types) instead of creating
             the sample — re-call with those fields populated.
@@ -852,14 +855,26 @@ def create_sample_from_template(
         }
 
     # Convert caller-supplied fields dict into the list format the SDK expects,
-    # matching against the template field definitions to pick up the field id.
+    # matching against the template field definitions to pick up the field id and type.
+    # Radio  -> {"selectedOptions": [value]}       (single selection, wrapped in list)
+    # Choice -> {"selectedOptions": value}          (multi-selection, value must be a list)
+    # All other types -> {"content": str(value)}
     fields_payload = None
     if fields:
         template_field_by_name = {f["name"].lower(): f for f in template_fields}
         fields_payload = []
         for field_name, value in fields.items():
             tf = template_field_by_name.get(field_name.lower())
-            entry = {"content": str(value)}
+            field_type = (tf.get("type", "") if tf else "").lower()
+
+            if field_type == "radio":
+                entry = {"selectedOptions": [str(value)]}
+            elif field_type == "choice":
+                # Accept either a list or a single string for convenience
+                entry = {"selectedOptions": value if isinstance(value, list) else [str(value)]}
+            else:
+                entry = {"content": str(value)}
+
             if tf and "id" in tf:
                 entry["id"] = tf["id"]
             else:
