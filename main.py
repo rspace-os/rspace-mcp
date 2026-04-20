@@ -789,29 +789,38 @@ def create_sample_from_template(
     """
     Creates a new sample based on an existing sample template.
 
-    Usage: Use when a sample template defines the required fields, units, and structure.
-    Template ID: Must be the global ID with the "IT" prefix, e.g. "IT12".
-                 Use list_sample_templates to discover available templates and their global IDs.
-                 Using the full global ID (not just the numeric part) avoids ambiguity with
-                 other resource types.
+    Recommended workflow:
+      1. list_sample_templates  — find the right template and note its global ID (e.g. "IT12")
+      2. get_sample_template    — inspect field names, types, allowed options, and which are mandatory
+      3. create_sample_from_template — create the sample, supplying values for the fields you want set
 
-    Fields: Pass a dict mapping field names to values for template-defined fields.
-            Value format depends on field type:
-              - String/Text/Number/Date/Time: plain value, e.g. {"Concentration": "5"}
-              - Radio: single string matching one of the allowed options, e.g. {"Source": "Commercial"}
-              - Choice: a list of strings matching allowed options, e.g. {"Supplier": ["NEB", "Sigma"]}
-            You only need to supply fields you want to set — the tool automatically sends
-            all other template fields as blank so the API accepts the request (the API
-            rejects payloads that omit any template field, even optional ones).
-            Before calling this tool, use get_sample_template to inspect the template
-            and discover which fields exist, their types, allowed options, and which are mandatory.
-            If any mandatory fields are missing from 'fields', this tool will return
-            an error listing the missing fields (with their types) instead of creating
-            the sample — re-call with those fields populated.
+    template_id:
+      Must use the global ID format with the "IT" prefix, e.g. "IT12" (not just the number).
+      This avoids ambiguity with other RSpace resource types that share numeric IDs.
 
-    Quantity: Tracks total amount with specified units (ml, mg, μl, etc.).
+    fields:
+      A dict of field name → value for the template's custom fields. Only include fields
+      you want to set — blank fields are sent automatically so the API accepts the request.
 
-    Returns: Created sample information including generated subsample IDs.
+      IMPORTANT: the API requires all template fields to be present in the request, even
+      optional ones left blank (e.g. date fields). This tool handles that automatically.
+
+      Value format by field type:
+        String / Text / Number   →  plain value          e.g. {"Concentration": "5"}
+        Date                     →  ISO 8601 string      e.g. {"Receipt date": "2024-03-15"}
+        Radio                    →  single string from the allowed options
+                                                          e.g. {"Antibiotic resistance": "Kanamycin"}
+        Choice                   →  list of strings from the allowed options
+                                                          e.g. {"Supplier": ["NEB", "Sigma"]}
+
+      If any mandatory fields are omitted, the tool returns an error listing the missing
+      fields (names, types, and allowed options where applicable) — re-call with those
+      fields included rather than attempting to create the sample.
+
+    quantity:
+      Total amount with units (ml, mg, μl, etc.). Only relevant if the template tracks quantity.
+
+    Returns: Created sample dict including global ID and generated subsample IDs.
     """
     if not str(template_id).upper().startswith("IT"):
         return {
