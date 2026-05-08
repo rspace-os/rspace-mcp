@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field
 
 class Document(BaseModel):
     """ELN Document metadata - used for document listings"""
-    name: str = Field("document's name")
+    name: str = Field(description="Document name")
     globalId: str = Field(description="Global identifier")
     created: str = Field(description="The document's creation date")
 
@@ -54,8 +54,8 @@ class Sample(BaseModel):
     name: str = Field(description="Sample name")
     globalId: str = Field(description="Global identifier")
     created: str = Field(description="Creation date")
-    tags: List[str] = Field(description="Sample tags")
-    quantity: Optional[Dict] = Field(description="Sample quantity and units")
+    tags: List[str] = Field(default_factory=list, description="Sample tags")
+    quantity: Optional[Dict] = Field(default=None, description="Sample quantity and units")
 
 
 class Container(BaseModel):
@@ -63,7 +63,7 @@ class Container(BaseModel):
     name: str = Field(description="Container name")
     globalId: str = Field(description="Global identifier")
     cType: str = Field(description="Container type (LIST, GRID, WORKBENCH, IMAGE)")
-    capacity: Optional[int] = Field(description="Container capacity if applicable")
+    capacity: Optional[int] = Field(default=None, description="Container capacity if applicable")
 
 
 class GridLocation(BaseModel):
@@ -356,52 +356,36 @@ def search_recent_documents(
 def find_documents_by_content(
     content_terms: List[str],
     operator: Literal["and", "or"] = "and",
-    exclude_terms: List[str] = None,
     order_by: str = "lastModified desc",
     page_size: int = 20
 ) -> dict:
     """
-    Advanced content-based document search
-    
+    Full-text content-based document search
+
     Usage: Find documents containing specific content terms
-    
+
     Parameters:
     - content_terms: List of terms that should appear in document content
     - operator: "and" (all terms must appear) or "or" (any term can appear)
-    - exclude_terms: Optional list of terms to exclude from results
     - order_by: Sort results by field
     - page_size: Number of results to return
-    
+
     Returns: Dictionary with search results
-    
+
     Example: find_documents_by_content(["DNA", "extraction"], operator="and")
     """
     builder = AdvancedQueryBuilder(operator=operator)
-    
+
     for term in content_terms:
         builder.add_term(term, AdvancedQueryBuilder.QueryType.FULL_TEXT)
-    
-    # Note: RSpace API doesn't directly support exclusion, but we can filter results
+
     advanced_query = builder.get_advanced_query()
-    results = eln_cli.get_documents_advanced_query(
+    return eln_cli.get_documents_advanced_query(
         advanced_query=advanced_query,
         order_by=order_by,
         page_number=0,
         page_size=page_size
     )
-    
-    # Filter out documents containing excluded terms if specified
-    if exclude_terms and 'documents' in results:
-        filtered_docs = []
-        for doc in results['documents']:
-            # Check if any exclude terms are in the document name or other available text
-            doc_text = (doc.get('name', '') + ' ' + doc.get('tags', '')).lower()
-            if not any(exclude_term.lower() in doc_text for exclude_term in exclude_terms):
-                filtered_docs.append(doc)
-        results['documents'] = filtered_docs
-        results['totalHits'] = len(filtered_docs)
-    
-    return results
 
 # ==================== NOTEBOOK OPERATIONS ====================
 # Specialized tools for notebook creation and entry management
@@ -440,20 +424,58 @@ def create_notebook_entry(
 # ==================== DOCUMENT METADATA MANAGEMENT ====================
 # Tools for organizing and categorizing documents
 
+def _current_doc_tags(doc_id: Union[int, str]) -> List[str]:
+    """Fetch a document's tags as a deduplicated list (server returns CSV string)."""
+    doc = eln_cli.get_document(doc_id)
+    raw = doc.get("tags") or ""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = raw.split(",")
+    seen, out = set(), []
+    for t in items:
+        t = t.strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 @mcp.tool(tags={"rspace"}, name="tagDocumentOrNotebookEntry")
 def tag_document(
         doc_id: int | str,
-        tags: Annotated[List[str], Field(description="One or more tags in a list")]
+        tags: Annotated[List[str], Field(description="One or more tags to add")]
 ) -> Dict[str, any]:
     """
-    Adds tags to documents for organization and searchability
-    
+    Appends tags to a document, preserving any tags already set
+
     Usage: Categorize documents by project, experiment type, etc.
-    Tags: Use consistent naming for better organization
-    Returns: Updated document with new tags
+    Behaviour: Existing tags are kept; duplicates are deduplicated
+    To replace or remove tags, use update_document or remove_tags_from_document.
+    Returns: Updated document with the merged tag set
     """
-    resp = eln_cli.update_document(document_id=doc_id, tags=tags)
-    return resp
+    existing = _current_doc_tags(doc_id)
+    seen = {t.lower() for t in existing}
+    merged = existing + [t.strip() for t in tags if t.strip() and t.strip().lower() not in seen]
+    return eln_cli.update_document(document_id=doc_id, tags=merged)
+
+
+@mcp.tool(tags={"rspace"})
+def remove_tags_from_document(
+        doc_id: int | str,
+        tags: Annotated[List[str], Field(description="One or more tags to remove (case-insensitive)")]
+) -> Dict[str, any]:
+    """
+    Removes specific tags from a document, leaving other tags intact
+
+    Usage: Untag documents without overwriting the rest of their tag set
+    Matching: Case-insensitive
+    Returns: Updated document with the requested tags removed
+    """
+    existing = _current_doc_tags(doc_id)
+    drop = {t.strip().lower() for t in tags if t.strip()}
+    remaining = [t for t in existing if t.lower() not in drop]
+    return eln_cli.update_document(document_id=doc_id, tags=remaining)
 
 
 @mcp.tool(tags={"rspace"}, name="renameDocumentOrNotebookEntry")
@@ -623,7 +645,8 @@ def activity(
     
     Returns: Chronological list of system events
     """
-    resp = eln_cli.get_activity(users=[username], global_id=global_id, date_from=date_from, date_to=date_to)
+    users = [username] if username else None
+    resp = eln_cli.get_activity(users=users, global_id=global_id, date_from=date_from, date_to=date_to)
     return resp
 
 
@@ -653,27 +676,28 @@ def uploadAndAttachFile(
     document_id: Union[int, str],
     file_path: str,
     caption: Optional[str] = None,
-    description: Optional[str] = None
+    heading: Optional[str] = None
 ) -> dict:
     """
     Uploads a file to RSpace and attaches it to a document as a proper file attachment
-    
+
     Usage: One-step process to upload any file and attach it to an RSpace document
     File types: Supports all file types (images, PDFs, data files, protocols, etc.)
     Attachment: Creates proper RSpace file attachment, not just a link
-    
+
     Parameters:
     - document_id: RSpace document ID (numeric or global ID like "SD12345")
     - file_path: Path to the file to upload (e.g., "data/results.pdf")
-    - caption: Optional caption that appears with the attachment
-    - description: Optional description for the uploaded file
-    
+    - caption: Optional caption stored as the file's gallery metadata (visible in
+      the file properties view)
+    - heading: Optional bold heading inserted in the document above the attachment
+
     Returns: Upload confirmation and document update information
     """
     try:
-        # Step 1: Upload the file to RSpace
+        # Step 1: Upload the file to RSpace (caption -> file gallery metadata)
         with open(file_path, 'rb') as file:
-            upload_result = eln_cli.upload_file(file, caption=description)
+            upload_result = eln_cli.upload_file(file, caption=caption)
         
         file_id = upload_result.get('id')
         if not file_id:
@@ -688,9 +712,9 @@ def uploadAndAttachFile(
         # This is the key fix - use RSpace's native attachment format
         attachment_html = f'<fileId={file_id}>'
         
-        # Add caption as separate paragraph if provided
-        if caption:
-            attachment_html = f'<p><strong>{caption}</strong></p>\n{attachment_html}'
+        # Add heading as a separate paragraph if provided
+        if heading:
+            attachment_html = f'<p><strong>{heading}</strong></p>\n{attachment_html}'
         
         # Step 4: Update the document with the file attachment
         first_field = document['fields'][0]
@@ -714,11 +738,11 @@ def uploadAndAttachFile(
                 "name": upload_result.get('name'),
                 "size": upload_result.get('size'),
                 "globalId": upload_result.get('globalId'),
-                "description": description
+                "caption": caption
             },
             "attachment_info": {
                 "document_id": str(document_id),
-                "caption": caption,
+                "heading": heading,
                 "attachment_format": "rspace_native",
                 "field_updated": first_field['id']
             },
@@ -925,12 +949,13 @@ def get_sample(sample_id: Union[int, str]) -> dict:
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
-def list_samples(page_size: int = 20, order_by: str = "lastModified", sort_order: str = "desc") -> dict:
+def list_samples(page_size: int = 20, order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
     """
     Lists samples in the inventory with pagination and sorting
-    
+
     Usage: Browse sample collection, find recent additions
-    Sorting: Options include "lastModified", "name", "created"
+    Sorting: order_by must be one of: name, type, globalId, creationDate,
+             modificationDate. sort_order is "asc" or "desc".
     Returns: Paginated list of sample metadata
     """
     pagination = i.Pagination(page_size=page_size, order_by=order_by, sort_order=sort_order)
@@ -961,8 +986,7 @@ def split_subsample(
     Quantity: If specified, each new subsample gets this amount
     Returns: Information about newly created subsamples
     """
-    result = inv_cli.split_subsample(subsample_id, num_new_subsamples, quantity_per_subsample)
-    return result.data if hasattr(result, 'data') else result
+    return inv_cli.split_subsample(subsample_id, num_new_subsamples, quantity_per_subsample)
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
@@ -1394,26 +1418,39 @@ def add_extra_fields_to_item(item_id: Union[int, str], field_data: List[dict]) -
     
     Returns: Updated item with new custom fields
     """
+    type_map = {"text": i.ExtraFieldType.TEXT, "number": i.ExtraFieldType.NUMBER}
     extra_fields = []
     for field in field_data:
-        field_type = i.ExtraFieldType.TEXT if field.get('type', 'text').lower() == 'text' else i.ExtraFieldType.NUMBER
-        ef = i.ExtraField(field['name'], field_type, field.get('content', ''))
+        raw_type = str(field.get('type', 'text')).lower()
+        if raw_type not in type_map:
+            raise ValueError(
+                f"Unknown extra field type {raw_type!r} for field "
+                f"{field.get('name')!r}; must be one of {sorted(type_map)}"
+            )
+        ef = i.ExtraField(field['name'], type_map[raw_type], field.get('content', ''))
         extra_fields.append(ef)
-    
+
     return inv_cli.add_extra_fields(item_id, *extra_fields)
 
 
 @mcp.tool(tags={"rspace", "inventory", "utility"})
-def generate_barcode(global_id: str, barcode_type: str = "BARCODE") -> bytes:
+def generate_barcode(global_id: str, barcode_type: str = "BARCODE") -> dict:
     """
     Generates scannable barcodes for inventory items
-    
+
     Usage: Create physical labels for sample tracking and identification
     Types: 'BARCODE' for standard linear barcodes, 'QR' for QR codes
-    Returns: Binary barcode image data for printing or display
+    Returns: dict with `content_type` and `data_base64` (PNG image as base64),
+             ready for embedding or saving to disk
     """
-    bc_type = i.Barcode.BARCODE if barcode_type.upper() == "BARCODE" else i.Barcode.QR
-    return inv_cli.barcode(global_id, barcode_type=bc_type)
+    import base64
+    bc_type = i.BarcodeFormat.BARCODE if barcode_type.upper() == "BARCODE" else i.BarcodeFormat.QR
+    raw = inv_cli.barcode(global_id, barcode_type=bc_type)
+    return {
+        "content_type": "image/png",
+        "data_base64": base64.b64encode(raw).decode("ascii"),
+        "size_bytes": len(raw),
+    }
 
 
 # ==================== PERFORMANCE-OPTIMIZED UTILITY FUNCTIONS ====================
@@ -1447,36 +1484,104 @@ def get_container_contents_only(container_id: int | str) -> list:
 @mcp.tool(tags={"rspace", "inventory", "utility"})
 def bulk_create_samples(sample_definitions: List[dict]) -> dict:
     """
-    Creates multiple samples efficiently in a single operation
-    
-    Usage: High-performance sample creation for large datasets
-    Performance: Much faster than individual create_sample calls
-    Format: List of sample definition dictionaries
-    
-    Note: Implementation should use batch API endpoints when available
-    Returns: Results for all created samples with error handling
+    Creates multiple samples in a single batch request
+
+    Usage: High-performance sample creation for large datasets — much faster
+    than calling create_sample in a loop
+    Limit: Up to InventoryClient.MAX_BULK samples per call (raises if exceeded)
+
+    Each entry in sample_definitions accepts the same keys as create_sample:
+      - name (required, str)
+      - tags (list[str], optional)
+      - description (str, optional)
+      - subsample_count (int, optional)
+      - total_quantity_value (float, optional)
+      - total_quantity_unit (str, default "ml" — only used if value supplied)
+
+    Returns: dict with overall success flag, success/error counts, and per-sample
+    results in `results`
     """
-    # TODO: Implement bulk creation logic
-    # This would use batch endpoints or optimized iteration
-    # depending on what the RSpace API supports
-    pass
+    if not sample_definitions:
+        raise ValueError("sample_definitions must contain at least one sample")
+    if len(sample_definitions) > i.InventoryClient.MAX_BULK:
+        raise ValueError(
+            f"bulk_create_samples accepts at most {i.InventoryClient.MAX_BULK} "
+            f"samples per call (got {len(sample_definitions)})"
+        )
+
+    from rspace_client.inv import quantity_unit as qu
+
+    posts = []
+    for idx, sd in enumerate(sample_definitions):
+        if not sd.get("name"):
+            raise ValueError(f"sample_definitions[{idx}] missing required 'name'")
+        quantity = None
+        if sd.get("total_quantity_value") is not None:
+            unit = qu.QuantityUnit.of(sd.get("total_quantity_unit", "ml"))
+            quantity = i.Quantity(sd["total_quantity_value"], unit)
+        posts.append(i.SamplePost(
+            name=sd["name"],
+            tags=i.gen_tags(sd["tags"]) if sd.get("tags") else [],
+            description=sd.get("description"),
+            subsample_count=sd.get("subsample_count"),
+            total_quantity=quantity,
+        ))
+
+    result = inv_cli.bulk_create_sample(*posts)
+    payload = result.data if hasattr(result, "data") else result
+    return {
+        "success": result.is_ok() if hasattr(result, "is_ok") else True,
+        "results": payload,
+    }
 
 
 @mcp.tool(tags={"rspace", "inventory", "utility"})
 def get_recent_samples_summary(days_back: int = 7, page_size: int = 10) -> list:
     """
-    Retrieves recent samples with minimal data for dashboard views
-    
+    Retrieves recently modified samples with minimal data for dashboard views
+
     Usage: Quick overview of recent activity without full sample details
-    Performance: Optimized for dashboard and summary displays
-    Filtering: Configurable time window and result count
-    
-    Returns: Lightweight sample list with essential information only
+    Implementation: Lists samples sorted by lastModified desc and filters
+    client-side to those modified within `days_back` days. The RSpace inventory
+    API does not currently support server-side date filters for samples.
+    Limitation: Only the most recent `page_size` samples are inspected — increase
+    page_size if you need a longer window into very active inventories.
+
+    Returns: List of slim sample summaries (globalId, name, lastModified,
+    tags, quantity)
     """
-    # TODO: Implement efficient recent samples query
-    # This would use date filtering and minimal field selection
-    # for optimal performance
-    pass
+    from datetime import datetime, timedelta, timezone
+
+    pagination = i.Pagination(
+        page_size=page_size, order_by="modificationDate", sort_order="desc"
+    )
+    page = inv_cli.list_samples(pagination)
+    samples = page.get("samples") or page.get("items") or []
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days_back)
+
+    def _modified(s):
+        ts = s.get("lastModified") or s.get("created")
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    out = []
+    for s in samples:
+        m = _modified(s)
+        if m is None or m < cutoff:
+            continue
+        out.append({
+            "globalId": s.get("globalId"),
+            "name": s.get("name"),
+            "lastModified": s.get("lastModified"),
+            "tags": s.get("tags"),
+            "quantity": s.get("quantity"),
+        })
+    return out
 
 
 # ============================================================================
