@@ -709,7 +709,8 @@ def uploadAndAttachFile(
     document_id: Union[int, str],
     file_path: str,
     caption: Optional[str] = None,
-    heading: Optional[str] = None
+    heading: Optional[str] = None,
+    field_id: Optional[Union[int, str]] = None,
 ) -> dict:
     """
     Uploads a file to RSpace and attaches it to a document as a proper file attachment
@@ -724,6 +725,9 @@ def uploadAndAttachFile(
     - caption: Optional caption stored as the file's gallery metadata (visible in
       the file properties view)
     - heading: Optional bold heading inserted in the document above the attachment
+    - field_id: Numeric ID of the document field to append the attachment to.
+      Defaults to the first field. Use get_single_Rspace_document to discover
+      field IDs for multi-field forms.
 
     Returns: Upload confirmation and document update information
     """
@@ -750,15 +754,23 @@ def uploadAndAttachFile(
             attachment_html = f'<p><strong>{heading}</strong></p>\n{attachment_html}'
         
         # Step 4: Update the document with the file attachment
-        first_field = document['fields'][0]
-        current_content = first_field.get('content', '')
+        if field_id is not None:
+            target = next(
+                (f for f in document['fields'] if str(f['id']) == str(field_id)),
+                None,
+            )
+            if target is None:
+                return {"error": f"Document {document_id} has no field with id {field_id}"}
+        else:
+            target = document['fields'][0]
+        current_content = target.get('content', '')
         updated_content = current_content + '\n' + attachment_html
-        
+
         # Update the document
         update_result = eln_cli.update_document(
             document_id=document_id,
             fields=[{
-                'id': first_field['id'],
+                'id': target['id'],
                 'content': updated_content
             }]
         )
@@ -777,7 +789,7 @@ def uploadAndAttachFile(
                 "document_id": str(document_id),
                 "heading": heading,
                 "attachment_format": "rspace_native",
-                "field_updated": first_field['id']
+                "field_updated": target['id']
             },
             "updated_document": update_result
         }
@@ -982,7 +994,91 @@ def get_sample(sample_id: Union[int, str]) -> dict:
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
-def list_samples(page_size: int = 20, order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
+def get_subsample(subsample_id: Union[int, str]) -> dict:
+    """
+    Retrieves complete information about a specific subsample
+
+    Usage: Inspect a single subsample's metadata, parent sample, and storage
+    location without listing the whole sample
+    Parameters: subsample_id can be numeric ID or global ID (e.g., "SS12345")
+    Returns: Full subsample details
+    """
+    return inv_cli.get_subsample_by_id(subsample_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "samples"})
+def list_subsamples(page_size: int = 20, page_number: int = 0,
+                    order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
+    """
+    Lists subsamples in the inventory with pagination and sorting
+
+    Usage: Browse subsamples directly without traversing parent samples
+    Sorting: order_by must be one of: name, type, globalId, creationDate,
+             modificationDate. sort_order is "asc" or "desc".
+    Returns: Paginated list of subsample metadata
+    """
+    pagination = i.Pagination(page_size=page_size, page_number=page_number,
+                              order_by=order_by, sort_order=sort_order)
+    return inv_cli.list_subsamples(pagination)
+
+
+@mcp.tool(tags={"rspace", "inventory", "samples"})
+def delete_sample(sample_id: Union[int, str]) -> dict:
+    """
+    Deletes (trashes) a sample and its subsamples
+
+    Usage: Remove a sample from active inventory
+    Behaviour: Soft-delete — the item is moved to trash; cannot be undone
+    via this MCP. Do not call on samples whose subsamples are still placed
+    in containers if you want to keep the container intact.
+    Returns: The trashed sample dict (with deleted=True)
+    """
+    return inv_cli.delete_sample(sample_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "samples"})
+def delete_subsample(subsample_id: Union[int, str]) -> dict:
+    """
+    Deletes (trashes) a single subsample
+
+    Usage: Remove an aliquot without affecting its parent sample's other
+    subsamples
+    Returns: API confirmation
+    """
+    sid = str(subsample_id)
+    numeric = int(sid[2:]) if sid.upper().startswith("SS") else int(sid)
+    return inv_cli.doDelete("subSamples", numeric)
+
+
+@mcp.tool(tags={"rspace", "inventory", "containers"})
+def delete_container(container_id: Union[int, str]) -> dict:
+    """
+    Deletes (trashes) a container
+
+    Usage: Remove a container from active inventory
+    Restriction: The container must be empty — the API rejects deletion
+    of a container that still has items in any of its locations
+    Returns: The trashed container dict
+    """
+    cid = str(container_id)
+    numeric = int(cid[2:]) if cid.upper().startswith(("BC", "IC", "GC", "LC")) else int(cid)
+    return inv_cli.doDelete("containers", numeric)
+
+
+@mcp.tool(tags={"rspace", "inventory", "templates"})
+def delete_sample_template(template_id: Union[int, str]) -> dict:
+    """
+    Deletes a sample template
+
+    Usage: Remove a template that is no longer needed
+    Returns: API confirmation (empty response on success)
+    """
+    return inv_cli.delete_sample_template(template_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "samples"})
+def list_samples(page_size: int = 20, page_number: int = 0,
+                 order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
     """
     Lists samples in the inventory with pagination and sorting
 
@@ -991,7 +1087,8 @@ def list_samples(page_size: int = 20, order_by: str = "modificationDate", sort_o
              modificationDate. sort_order is "asc" or "desc".
     Returns: Paginated list of sample metadata
     """
-    pagination = i.Pagination(page_size=page_size, order_by=order_by, sort_order=sort_order)
+    pagination = i.Pagination(page_size=page_size, page_number=page_number,
+                              order_by=order_by, sort_order=sort_order)
     return inv_cli.list_samples(pagination)
 
 
