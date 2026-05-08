@@ -1070,6 +1070,99 @@ def create_grid_container(
 
 
 @mcp.tool(tags={"rspace", "inventory", "containers"})
+def create_image_container(
+    name: str,
+    image_path: str,
+    locations: List[List[int]] = None,
+    description: str = None,
+    tags: List[str] = None,
+    can_store_containers: bool = True,
+    can_store_samples: bool = True,
+    parent_container_id: Union[int, str] = None
+) -> dict:
+    """
+    Creates an image-based container with marked locations on a background image
+
+    Usage: Visualise storage layouts that don't fit a regular grid (bench photos,
+    cryo-rack diagrams, microscope slide maps)
+    Image: Provide a local file path to a PNG/JPEG; encoded and uploaded by server
+    Locations: Optional list of [x, y] pixel coordinates marking storable spots.
+    Each returned location includes a server-assigned id needed for placing items
+    via move_items_to_image_container — read them from the response.
+
+    Returns: Created container with locations[].id values
+    """
+    if not os.path.isfile(image_path):
+        raise ValueError(f"image_path does not exist: {image_path}")
+
+    tag_objects = i.gen_tags(tags) if tags else []
+    location = i.TopLevelTargetLocation()
+    if parent_container_id:
+        location = i.ListContainerTargetLocation(parent_container_id)
+
+    coord_tuples = [tuple(p) for p in (locations or [])]
+
+    post = i.ImageContainerPost(
+        name=name,
+        image_file=image_path,
+        locations=coord_tuples,
+        tags=tag_objects,
+        description=description,
+        can_store_containers=can_store_containers,
+        can_store_samples=can_store_samples,
+        location=location,
+    )
+    return inv_cli.create_image_container(post)
+
+
+@mcp.tool(tags={"rspace", "inventory", "containers"})
+def add_image_container_locations(
+    container_id: Union[int, str],
+    locations: List[List[int]]
+) -> dict:
+    """
+    Adds new marker locations to an existing image container
+
+    Usage: Iteratively refine an image container's location markers without
+    recreating it
+    Locations: List of [x, y] pixel coordinates
+    Returns: Updated image container including all locations with their ids
+    """
+    coord_tuples = [tuple(p) for p in locations]
+    return inv_cli.add_locations_to_image_container(container_id, *coord_tuples)
+
+
+@mcp.tool(tags={"rspace", "inventory", "containers"})
+def delete_image_container_locations(
+    container_id: Union[int, str],
+    location_ids: List[int]
+) -> dict:
+    """
+    Removes marker locations from an image container
+
+    Usage: Clean up unused or mistaken markers
+    Note: Locations occupied by items cannot be deleted
+    Returns: Updated image container
+    """
+    return inv_cli.delete_locations_from_image_container(container_id, *location_ids)
+
+
+@mcp.tool(tags={"rspace", "inventory"})
+def set_item_image(item_id: Union[int, str], image_path: str) -> dict:
+    """
+    Sets or replaces the image for a sample, subsample, or container
+
+    Usage: Attach a photo to inventory items, or swap the background of an
+    existing image container
+    Returns: Updated item with image and thumbnail links
+    """
+    if not os.path.isfile(image_path):
+        raise ValueError(f"image_path does not exist: {image_path}")
+    with open(image_path, "rb") as f:
+        return inv_cli.set_image(item_id, f)
+
+
+@mcp.tool(tags={"rspace", "inventory", "containers"})
 def get_container(container_id: Union[int, str], include_content: bool = False) -> dict:
     """
     Retrieves container information with optional content listing
@@ -1209,6 +1302,27 @@ def move_items_to_specific_grid_locations(
     locations = [i.GridLocation(loc.x, loc.y) for loc in grid_locations]
     placement = i.ByLocation(locations, *item_ids)
     result = inv_cli.add_items_to_grid_container(target_container_id, placement)
+    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+
+
+@mcp.tool(tags={"rspace", "inventory", "movement"})
+def move_items_to_image_container(
+    target_container_id: Union[int, str],
+    item_ids: List[str],
+    location_ids: List[int]
+) -> dict:
+    """
+    Places items at specific marker locations within an image container
+
+    Usage: Populate an image container by mapping items to its predefined
+    location markers
+    Location IDs: The numeric ids of locations on the image container — get them
+    from create_image_container's response or get_container output
+    Validation: items and location_ids are zipped pairwise; extras are ignored
+
+    Returns: Success status and per-item placement results
+    """
+    result = inv_cli.add_items_to_image_container(target_container_id, item_ids, location_ids)
     return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
 
 
