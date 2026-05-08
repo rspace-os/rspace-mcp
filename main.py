@@ -85,9 +85,30 @@ load_dotenv()
 api_key = os.getenv("RSPACE_API_KEY")
 api_url = os.getenv("RSPACE_URL")
 
+if not api_key or not api_url:
+    raise RuntimeError(
+        "RSpace MCP server cannot start: RSPACE_API_KEY and RSPACE_URL must both "
+        "be set in the environment (e.g. via a .env file in the working directory)."
+    )
+
 # Initialize RSpace clients
 eln_cli = e.ELNClient(api_url, api_key)  # Electronic Lab Notebook operations
 inv_cli = i.InventoryClient(api_url, api_key)  # Inventory Management operations
+
+
+def _bulk_result(result) -> dict:
+    """Normalise an SDK BulkOperationResult into a JSON-friendly shape."""
+    if isinstance(result, i.BulkOperationResult):
+        successes = list(result.success_results() or [])
+        errors = list(result.error_results() or [])
+        return {
+            "success": result.is_ok(),
+            "success_count": len(successes),
+            "error_count": len(errors),
+            "results": list(result.results() or []),
+            "errors": errors,
+        }
+    return {"success": True, "results": result}
 
 
 # ============================================================================
@@ -114,17 +135,20 @@ def status() -> str:
 # Core document operations - reading, creating, updating documents
 
 @mcp.tool(tags={"rspace"})
-def get_documents(page_size: int = 20) -> list[Document]:
+def get_documents(page_size: int = 20, page_number: int = 0) -> list[Document]:
     """
     Retrieves recent RSpace documents with pagination
-    
+
     Usage: Get overview of recent documents for browsing/selection
     Limit: Maximum 200 documents per call for performance
+    Pagination: page_number is 0-based; combine with page_size to walk results
     Returns: List of document metadata (not full content)
     """
     if page_size > 200 or page_size < 0:
-        raise ValueError("page size must be less than 200")
-    resp = eln_cli.get_documents(page_size=page_size)
+        raise ValueError("page_size must be between 0 and 200")
+    if page_number < 0:
+        raise ValueError("page_number must be >= 0")
+    resp = eln_cli.get_documents(page_size=page_size, page_number=page_number)
     return resp['documents']
 
 
@@ -213,7 +237,14 @@ def search_documents(
     """
     if page_size > 200:
         raise ValueError("page_size must be 200 or less")
-    
+    # include_content fetches each matched document one-by-one (N+1 HTTP calls).
+    # Cap it to a reasonable batch so a careless call can't fan out to 200 fetches.
+    if include_content and page_size > 25:
+        raise ValueError(
+            "include_content=True is limited to page_size <= 25 because each "
+            "result triggers an extra fetch. Lower page_size or paginate."
+        )
+
     if search_type == "simple":
         # Use simple search - works like RSpace's "All" search
         results = eln_cli.get_documents(
@@ -668,7 +699,9 @@ def download_file(
     
     Returns: Download status and file information
     """
-    resp = eln_cli.download_file(file_id=file_id, filename=file_path, chunk_size=1024)
+    # 64 KB chunks — large enough to keep TCP throughput up, small enough that
+    # we don't hold a giant file in memory if the SDK does that internally.
+    resp = eln_cli.download_file(file_id=file_id, filename=file_path, chunk_size=64 * 1024)
     return resp
 
 @mcp.tool(tags={"rspace", "files"})
@@ -1199,14 +1232,15 @@ def get_container(container_id: Union[int, str], include_content: bool = False) 
 
 
 @mcp.tool(tags={"rspace", "inventory", "containers"})
-def list_containers(page_size: int = 20) -> dict:
+def list_containers(page_size: int = 20, page_number: int = 0) -> dict:
     """
     Lists top-level containers (not nested within other containers)
-    
+
     Usage: Browse main container organization structure
+    Pagination: page_number is 0-based
     Returns: Paginated list of root-level containers
     """
-    pagination = i.Pagination(page_size=page_size)
+    pagination = i.Pagination(page_size=page_size, page_number=page_number)
     return inv_cli.list_top_level_containers(pagination)
 
 
@@ -1238,7 +1272,7 @@ def move_items_to_list_container(
     Returns: Success status and results for each moved item
     """
     result = inv_cli.add_items_to_list_container(target_container_id, *item_ids)
-    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+    return _bulk_result(result)
 
 
 @mcp.tool(tags={"rspace", "inventory", "movement"})
@@ -1271,7 +1305,7 @@ def move_items_to_grid_container_by_row(
     
     placement = i.ByRow(start_column, start_row, total_columns, total_rows, *item_ids)
     result = inv_cli.add_items_to_grid_container(target_container_id, placement)
-    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+    return _bulk_result(result)
 
 
 @mcp.tool(tags={"rspace", "inventory", "movement"})
@@ -1302,7 +1336,7 @@ def move_items_to_grid_container_by_column(
     
     placement = i.ByColumn(start_column, start_row, total_columns, total_rows, *item_ids)
     result = inv_cli.add_items_to_grid_container(target_container_id, placement)
-    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+    return _bulk_result(result)
 
 
 @mcp.tool(tags={"rspace", "inventory", "movement"})
@@ -1326,7 +1360,7 @@ def move_items_to_specific_grid_locations(
     locations = [i.GridLocation(loc.x, loc.y) for loc in grid_locations]
     placement = i.ByLocation(locations, *item_ids)
     result = inv_cli.add_items_to_grid_container(target_container_id, placement)
-    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+    return _bulk_result(result)
 
 
 @mcp.tool(tags={"rspace", "inventory", "movement"})
@@ -1347,7 +1381,7 @@ def move_items_to_image_container(
     Returns: Success status and per-item placement results
     """
     result = inv_cli.add_items_to_image_container(target_container_id, item_ids, location_ids)
-    return {"success": result.is_ok(), "results": result.data if hasattr(result, 'data') else str(result)}
+    return _bulk_result(result)
 
 
 # ==================== TEMPLATE MANAGEMENT ====================
@@ -1381,14 +1415,15 @@ def get_sample_template(template_id: str) -> dict:
 
 
 @mcp.tool(tags={"rspace", "inventory", "templates"})
-def list_sample_templates(page_size: int = 20) -> dict:
+def list_sample_templates(page_size: int = 20, page_number: int = 0) -> dict:
     """
     Lists available sample templates for reuse
-    
+
     Usage: Browse existing templates before creating new samples
+    Pagination: page_number is 0-based
     Returns: Paginated list of template metadata
     """
-    pagination = i.Pagination(page_size=page_size)
+    pagination = i.Pagination(page_size=page_size, page_number=page_number)
     return inv_cli.list_sample_templates(pagination)
 
 
@@ -1527,12 +1562,7 @@ def bulk_create_samples(sample_definitions: List[dict]) -> dict:
             total_quantity=quantity,
         ))
 
-    result = inv_cli.bulk_create_sample(*posts)
-    payload = result.data if hasattr(result, "data") else result
-    return {
-        "success": result.is_ok() if hasattr(result, "is_ok") else True,
-        "results": payload,
-    }
+    return _bulk_result(inv_cli.bulk_create_sample(*posts))
 
 
 @mcp.tool(tags={"rspace", "inventory", "utility"})
