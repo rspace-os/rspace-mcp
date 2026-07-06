@@ -74,9 +74,9 @@ This is a proof-of-concept MCP server for RSpace that runs locally on your machi
       }
       ```
       
-      ## Using the RSpace through the MCP server
+## Using the RSpace through the MCP server
       
-      Please bear in mind that this is a proof of concept and your production use case might require a more specific MCP server configured with specifically fine-tuned tools. The tools provided here in this prototype ...
+Please bear in mind that this is a proof of concept and your production use case might require a more specific MCP server configured with specifically fine-tuned tools. The tools provided here in this prototype ...
 - do not exhaustively feature the functionality currently available through the RSpace Python client
 - might be more than you need for your use case
 - might not be optimally configured for how you would like to interact with RSpace
