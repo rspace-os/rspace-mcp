@@ -1031,9 +1031,10 @@ def delete_sample(sample_id: Union[int, str]) -> dict:
     Behaviour: Soft-delete — the item is moved to trash; cannot be undone
     via this MCP. Do not call on samples whose subsamples are still placed
     in containers if you want to keep the container intact.
-    Returns: The trashed sample dict (with deleted=True)
+    Returns: A confirmation dict {"success": True, "deleted": <sample_id>}
     """
-    return inv_cli.delete_sample(sample_id)
+    inv_cli.delete_sample(sample_id)
+    return {"success": True, "deleted": str(sample_id)}
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
@@ -1071,9 +1072,10 @@ def delete_sample_template(template_id: Union[int, str]) -> dict:
     Deletes a sample template
 
     Usage: Remove a template that is no longer needed
-    Returns: API confirmation (empty response on success)
+    Returns: A confirmation dict {"success": True, "deleted": <template_id>}
     """
-    return inv_cli.delete_sample_template(template_id)
+    inv_cli.delete_sample_template(template_id)
+    return {"success": True, "deleted": str(template_id)}
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
@@ -1522,6 +1524,249 @@ def list_sample_templates(page_size: int = 20, page_number: int = 0) -> dict:
     """
     pagination = i.Pagination(page_size=page_size, page_number=page_number)
     return inv_cli.list_sample_templates(pagination)
+
+
+# ==================== INSTRUMENTS AND INSTRUMENT TEMPLATES ====================
+# Instruments are a native Inventory item type (RSpace 2.24+). Like samples,
+# they are created from a template that defines their custom fields. Instrument
+# records use the "IN" global-id prefix; instrument templates use "NT".
+#
+# Note: the generic utility tools also work on instruments once created —
+# rename_inventory_item, set_item_image, add_extra_fields_to_item and
+# generate_barcode all accept an instrument (IN...) or template (NT...) id.
+
+@mcp.tool(tags={"rspace", "inventory", "instruments", "templates"})
+def create_instrument_template(template_data: dict) -> dict:
+    """
+    Creates a reusable template for instrument creation
+
+    Usage: Standardize instrument registration with predefined custom fields
+    Template data: A dict with a mandatory "name" and an optional "fields" list,
+      e.g. {"name": "Microscope template",
+            "fields": [{"name": "Serial Number", "type": "string"},
+                       {"name": "Calibration", "type": "number"}]}
+      Supported field types: string, text, number, date, time, radio, choice,
+      attachment, uri. Radio/choice fields take a "definition": {"options": [...]}.
+      Unlike sample templates, instrument templates have no default unit.
+    Returns: Created instrument template including its global ID (NT...)
+    """
+    return inv_cli.create_instrument_template(template_data)
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments", "templates"})
+def get_instrument_template(template_id: str) -> dict:
+    """
+    Retrieves detailed information about an instrument template
+
+    Usage: Examine template structure before using for instrument creation.
+           Call this before create_instrument_from_template to discover available
+           fields, their types, and which are mandatory.
+    Template ID: Use the global ID with the "NT" prefix, e.g. "NT12".
+                 Use list_instrument_templates to find global IDs.
+    Returns: Complete template definition including field specifications
+    """
+    return inv_cli.get_instrument_template_by_id(template_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments", "templates"})
+def list_instrument_templates(page_size: int = 20, page_number: int = 0) -> dict:
+    """
+    Lists available instrument templates for reuse
+
+    Usage: Browse existing templates before creating new instruments
+    Pagination: page_number is 0-based
+    Returns: Paginated list of template metadata
+    """
+    pagination = i.Pagination(page_size=page_size, page_number=page_number)
+    return inv_cli.list_instrument_templates(pagination)
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments", "templates"})
+def delete_instrument_template(template_id: Union[int, str]) -> dict:
+    """
+    Deletes an instrument template
+
+    Usage: Remove an instrument template that is no longer needed
+    Returns: A confirmation dict {"success": True, "deleted": <template_id>}
+    """
+    inv_cli.delete_instrument_template(template_id)
+    return {"success": True, "deleted": str(template_id)}
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments"})
+def create_instrument(
+    name: str,
+    tags: List[str] = None,
+    description: str = None,
+) -> dict:
+    """
+    Creates a new instrument in the inventory system
+
+    Usage: Register a new instrument with basic metadata. If no template is
+      specified the default Basic Instrument template is used, giving an
+      instrument with no custom fields. To create an instrument with template
+      fields populated, use create_instrument_from_template instead.
+    Returns: Created instrument information including its global ID (IN...)
+    """
+    tag_objects = i.gen_tags(tags) if tags else []
+    return inv_cli.create_instrument(
+        name=name,
+        tags=tag_objects,
+        description=description,
+    )
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments"})
+def create_instrument_from_template(
+    template_id: str,
+    name: str,
+    fields: Dict[str, Any] = None,
+    tags: List[str] = None,
+    description: str = None,
+) -> dict:
+    """
+    Creates a new instrument based on an existing instrument template.
+
+    Recommended workflow:
+      1. list_instrument_templates  — find the right template and note its global ID (e.g. "NT12")
+      2. get_instrument_template    — inspect field names, types, allowed options, and which are mandatory
+      3. create_instrument_from_template — create the instrument, supplying values for the fields you want set
+
+    template_id:
+      Must use the global ID format with the "NT" prefix, e.g. "NT12" (not just the number).
+      This avoids ambiguity with other RSpace resource types that share numeric IDs.
+
+    fields:
+      A dict of field name → value for the template's custom fields. Only include fields
+      you want to set — blank fields are sent automatically so the API accepts the request.
+
+      Value format by field type:
+        String / Text / Number   →  plain value          e.g. {"Serial Number": "SN-1234"}
+        Date                     →  ISO 8601 string      e.g. {"Last serviced": "2024-03-15"}
+        Uri                      →  URL string           e.g. {"Manual": "https://example.com/manual.pdf"}
+        Radio                    →  single string from the allowed options
+        Choice                   →  list of strings from the allowed options
+
+      If any mandatory fields are omitted, the tool returns an error listing the missing
+      fields (names, types, and allowed options where applicable) — re-call with those
+      fields included rather than attempting to create the instrument.
+
+    Returns: Created instrument dict including its global ID (IN...).
+    """
+    if not str(template_id).upper().startswith("NT"):
+        return {
+            "error": "invalid_template_id",
+            "message": (
+                f"template_id must be a global ID with the 'NT' prefix, e.g. 'NT{template_id}'. "
+                "Use list_instrument_templates to find the correct global ID."
+            ),
+        }
+
+    # Extract the numeric part for the POST body — the API expects a plain integer
+    # for templateId, but get_instrument_template_by_id handles the full global ID fine.
+    numeric_template_id = int(str(template_id)[2:])
+
+    # Fetch the template to validate mandatory fields and build the full field list
+    template = inv_cli.get_instrument_template_by_id(template_id)
+    template_fields = template.get("fields", [])
+
+    # Normalise caller-supplied field names to lowercase for case-insensitive matching
+    supplied = {k.lower(): v for k, v in (fields or {}).items()}
+
+    missing_mandatory = [
+        {"name": f["name"], "type": f.get("type", "unknown")}
+        for f in template_fields
+        if f.get("mandatory") and f["name"].lower() not in supplied
+    ]
+
+    if missing_mandatory:
+        return {
+            "error": "mandatory_fields_missing",
+            "message": (
+                "The template has mandatory fields that must be supplied. "
+                "Re-call create_instrument_from_template with these fields included in 'fields'."
+            ),
+            "missing_mandatory_fields": missing_mandatory,
+            "all_template_fields": [
+                {
+                    "name": f["name"],
+                    "type": f.get("type", "unknown"),
+                    "mandatory": f.get("mandatory", False),
+                }
+                for f in template_fields
+            ],
+        }
+
+    # Build the full fields payload in template order. As with samples, the API
+    # requires every template field to be present — fields the caller didn't supply
+    # are sent as {} (or {"id": ...}), leaving the value blank.
+    #   Radio  -> {"selectedOptions": [value]}
+    #   Choice -> {"selectedOptions": value}   (single string auto-wrapped)
+    #   Date/Time/String/Number/Uri/… -> {"content": str(value)}
+    fields_payload = []
+    for tf in template_fields:
+        entry = {}
+        if "id" in tf:
+            entry["id"] = tf["id"]
+        value = supplied.get(tf["name"].lower())
+        if value is not None:
+            field_type = tf.get("type", "").lower()
+            if field_type == "radio":
+                entry["selectedOptions"] = [str(value)]
+            elif field_type == "choice":
+                entry["selectedOptions"] = value if isinstance(value, list) else [str(value)]
+            else:
+                entry["content"] = str(value)
+        fields_payload.append(entry)
+
+    tag_objects = i.gen_tags(tags) if tags else []
+
+    return inv_cli.create_instrument(
+        name=name,
+        tags=tag_objects,
+        description=description,
+        instrument_template_id=numeric_template_id,
+        fields=fields_payload,
+    )
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments"})
+def get_instrument(instrument_id: Union[int, str]) -> dict:
+    """
+    Retrieves complete information about a single instrument
+
+    Usage: Get full instrument details including custom field values
+    Parameters: instrument_id can be a numeric ID or a global ID (e.g. "IN123")
+    Returns: Full instrument description
+    """
+    return inv_cli.get_instrument_by_id(instrument_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments"})
+def list_instruments(page_size: int = 20, page_number: int = 0) -> dict:
+    """
+    Lists instruments visible to the current user
+
+    Usage: Browse registered instruments
+    Pagination: page_number is 0-based
+    Returns: Paginated list of instrument metadata
+    """
+    pagination = i.Pagination(page_size=page_size, page_number=page_number)
+    return inv_cli.list_instruments(pagination)
+
+
+@mcp.tool(tags={"rspace", "inventory", "instruments"})
+def delete_instrument(instrument_id: Union[int, str]) -> dict:
+    """
+    Deletes (marks as deleted) an instrument
+
+    Usage: Remove an instrument from Inventory listings. Can be reversed by an
+      admin/owner via restore in the RSpace UI.
+    Parameters: instrument_id can be a numeric ID or a global ID (e.g. "IN123")
+    Returns: A confirmation dict {"success": True, "deleted": <instrument_id>}
+    """
+    inv_cli.delete_instrument(instrument_id)
+    return {"success": True, "deleted": str(instrument_id)}
 
 
 # ==================== UTILITY AND HELPER FUNCTIONS ====================
