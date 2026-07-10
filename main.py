@@ -1957,6 +1957,76 @@ def get_recent_samples_summary(days_back: int = 7, page_size: int = 10) -> list:
 
 
 # ============================================================================
+# LISTS OF MATERIALS (ELN <-> INVENTORY LINKS)
+# ============================================================================
+# A List of Materials (LoM) links inventory items (samples, subsamples,
+# containers) to a text field of an ELN document. These tools wrap the
+# corresponding rspace-client InventoryClient methods.
+
+@mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
+def create_list_of_materials(
+    eln_field_id: int,
+    name: str,
+    materials: List[str],
+    description: Optional[str] = None,
+) -> dict:
+    """
+    Links inventory items to an ELN document field via a List of Materials
+
+    Usage: Record which samples/subsamples/containers were used in an
+    experiment by attaching them to a specific text field of an ELN document.
+    Parameters:
+      - eln_field_id: numeric ID of the ELN document field to attach the list
+        to. Obtain it from get_single_Rspace_document — each entry in the
+        returned 'fields' has an 'id'.
+      - name: a label for the list
+      - materials: global IDs of the inventory items to link, e.g.
+        ["SA12345", "SS6789", "IC42"] (samples, subsamples, containers)
+      - description: optional free-text description of the list's purpose
+    Returns: The newly created List of Materials
+    """
+    return inv_cli.create_list_of_materials(
+        eln_field_id, name, *materials, description=description
+    )
+
+
+@mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
+def get_lists_of_materials_for_document(document_id: Union[int, str]) -> List[dict]:
+    """
+    Retrieves all Lists of Materials attached to an ELN document
+
+    Usage: See every inventory item linked anywhere in a document
+    Parameters: document_id can be numeric ID or global ID (e.g., "SD12345")
+    Returns: A list of the Lists of Materials belonging to the document
+    """
+    return inv_cli.get_list_of_materials_for_document(document_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
+def get_lists_of_materials_for_field(field_id: Union[int, str]) -> List[dict]:
+    """
+    Retrieves all Lists of Materials attached to a single ELN document field
+
+    Usage: See the inventory items linked to one specific field of a document
+    Parameters: field_id is the numeric ID of the ELN document field
+    Returns: A list of the Lists of Materials belonging to the field
+    """
+    return inv_cli.get_list_of_materials_for_field(field_id)
+
+
+@mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
+def get_list_of_materials(lom_id: int) -> dict:
+    """
+    Retrieves a single List of Materials by its ID
+
+    Usage: Inspect the details and linked items of one specific list
+    Parameters: lom_id is the numeric ID of the List of Materials
+    Returns: The List of Materials
+    """
+    return inv_cli.get_list_of_materials(lom_id)
+
+
+# ============================================================================
 # SERVER EXECUTION
 # ============================================================================
 # This section handles the actual MCP server startup
