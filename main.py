@@ -1991,25 +1991,25 @@ def create_list_of_materials(
 
 
 @mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
-def get_lists_of_materials_for_document(document_id: Union[int, str]) -> dict:
+def get_lists_of_materials_for_document(document_id: Union[int, str]) -> List[dict]:
     """
     Retrieves all Lists of Materials attached to an ELN document
 
     Usage: See every inventory item linked anywhere in a document
     Parameters: document_id can be numeric ID or global ID (e.g., "SD12345")
-    Returns: The Lists of Materials belonging to the document
+    Returns: A list of the Lists of Materials belonging to the document
     """
     return inv_cli.get_list_of_materials_for_document(document_id)
 
 
 @mcp.tool(tags={"rspace", "inventory", "eln", "lom"})
-def get_lists_of_materials_for_field(field_id: Union[int, str]) -> dict:
+def get_lists_of_materials_for_field(field_id: Union[int, str]) -> List[dict]:
     """
     Retrieves all Lists of Materials attached to a single ELN document field
 
     Usage: See the inventory items linked to one specific field of a document
     Parameters: field_id is the numeric ID of the ELN document field
-    Returns: The Lists of Materials belonging to the field
+    Returns: A list of the Lists of Materials belonging to the field
     """
     return inv_cli.get_list_of_materials_for_field(field_id)
 
