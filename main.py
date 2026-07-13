@@ -844,6 +844,37 @@ def create_sample(
     )
 
 
+def _build_link_field_value(field_name: str, value: Any) -> dict:
+    """Serialise a caller-supplied value for a Link custom field.
+
+    A Link field does not hold text: it points at another RSpace record with a
+    typed, optionally version-pinned relationship. The caller supplies a dict
+    describing the target and the relationship, e.g.
+        {"relationType": "References", "targetGlobalId": "SA123"}
+    snake_case keys (relation_type / target_global_id / version_pin) are also
+    accepted. Returns the API "link" payload
+    {"relationType": ..., "targetGlobalId": ..., "versionPin": ...}.
+
+    Validation (target global-id prefix, relationType vocabulary) is delegated to
+    the client's InventoryLink so the server stays the source of truth.
+    """
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Link field {field_name!r} value must be a dict with 'relationType' and "
+            f"'targetGlobalId', e.g. {{'relationType': 'References', 'targetGlobalId': 'SA123'}}; "
+            f"got {value!r}"
+        )
+    relation = value.get("relationType", value.get("relation_type"))
+    target = value.get("targetGlobalId", value.get("target_global_id"))
+    version = value.get("versionPin", value.get("version_pin"))
+    if not relation or not target:
+        raise ValueError(
+            f"Link field {field_name!r} requires both 'relationType' and 'targetGlobalId'; "
+            f"got {value!r}"
+        )
+    return i.InventoryLink(relation, target, version)._toDict()
+
+
 @mcp.tool(tags={"rspace", "inventory", "samples"})
 def create_sample_from_template(
     template_id: str,
@@ -876,11 +907,20 @@ def create_sample_from_template(
 
       Value format by field type:
         String / Text / Number   →  plain value          e.g. {"Concentration": "5"}
-        Date                     →  ISO 8601 string      e.g. {"Receipt date": "2024-03-15"}
+        Date / Time              →  ISO 8601 string      e.g. {"Receipt date": "2024-03-15"}
+        Uri                      →  URL string           e.g. {"Manual": "https://example.com/manual.pdf"}
         Radio                    →  single string from the allowed options
                                                           e.g. {"Antibiotic resistance": "Kanamycin"}
         Choice                   →  list of strings from the allowed options
                                                           e.g. {"Supplier": ["NEB", "Sigma"]}
+        Link                     →  a dict pointing at another record, with a typed relationship
+                                     {"relationType": <type>, "targetGlobalId": <global id>}
+                                     e.g. {"Parent batch": {"relationType": "IsDerivedFrom", "targetGlobalId": "SA84"}}
+                                     Optional "versionPin" (int) pins the link to a target version.
+                                     relationType must be one of the field's allowedRelationTypes (from
+                                     get_sample_template); the target global ID must be an Inventory or ELN
+                                     record (SA/SS/IC/IN/IT/SD/NB/GL prefix). A Link field is NOT a plain URL —
+                                     use a Uri field for external links.
 
       If any mandatory fields are omitted, the tool returns an error listing the missing
       fields (names, types, and allowed options where applicable) — re-call with those
@@ -943,7 +983,8 @@ def create_sample_from_template(
     # Value serialisation by field type:
     #   Radio  -> {"selectedOptions": [value]}   single selection, wrapped in list
     #   Choice -> {"selectedOptions": value}      multi-selection; single string auto-wrapped
-    #   Date/Time/String/Number/… -> {"content": str(value)}
+    #   Link   -> {"link": {"relationType": ..., "targetGlobalId": ...}}   typed record link
+    #   Date/Time/String/Number/Uri/… -> {"content": str(value)}
     fields_payload = []
     for tf in template_fields:
         entry = {}
@@ -956,6 +997,8 @@ def create_sample_from_template(
                 entry["selectedOptions"] = [str(value)]
             elif field_type == "choice":
                 entry["selectedOptions"] = value if isinstance(value, list) else [str(value)]
+            elif field_type == "link":
+                entry["link"] = _build_link_field_value(tf["name"], value)
             else:
                 entry["content"] = str(value)
         # If value is None, entry stays as {} (or {"id": ...}), satisfying the API's
@@ -1490,10 +1533,23 @@ def move_items_to_image_container(
 def create_sample_template(template_data: dict) -> dict:
     """
     Creates a reusable template for sample creation
-    
+
     Usage: Standardize sample creation with predefined fields and validation
-    Template data: Define field structure, default values, and constraints
-    Returns: Created template information for future sample generation
+    Template data: A dict with a mandatory "name", a "defaultUnitId" (the quantity
+      unit id, e.g. 3 for ml) and a "fields" list, e.g.
+        {"name": "Antibody template", "defaultUnitId": 3,
+         "fields": [{"name": "Clone", "type": "string"},
+                    {"name": "Concentration", "type": "number"},
+                    {"name": "Parent batch", "type": "link",
+                     "allowedRelationTypes": ["IsDerivedFrom"]}]}
+      Supported field types: string, text, number, date, time, radio, choice,
+      attachment, uri, link. Radio/choice fields take a "definition": {"options": [...]}.
+      A link field defines a typed relationship to another record (not a URL — use
+      uri for URLs). It may optionally whitelist which relationships are allowed via
+      "allowedRelationTypes"; omitting it permits all relationship types. Relationship
+      types come from the DataCite vocabulary plus IsCalibratedBy/Calibrates
+      (e.g. References, IsDerivedFrom, IsDescribedBy, HasPart, IsCalibratedBy).
+    Returns: Created template including its global ID (IT...)
     """
     return inv_cli.create_sample_template(template_data)
 
@@ -1546,7 +1602,15 @@ def create_instrument_template(template_data: dict) -> dict:
             "fields": [{"name": "Serial Number", "type": "string"},
                        {"name": "Calibration", "type": "number"}]}
       Supported field types: string, text, number, date, time, radio, choice,
-      attachment, uri. Radio/choice fields take a "definition": {"options": [...]}.
+      attachment, uri, link. Radio/choice fields take a "definition": {"options": [...]}.
+      A link field defines a typed relationship to another record (not a URL — use
+      uri for URLs). It may optionally whitelist which relationships are allowed via
+      "allowedRelationTypes", e.g.
+        {"name": "Calibrated by", "type": "link",
+         "allowedRelationTypes": ["IsCalibratedBy"]}
+      Omitting allowedRelationTypes permits all relationship types. Relationship
+      types come from the DataCite vocabulary plus IsCalibratedBy/Calibrates
+      (e.g. References, IsDerivedFrom, IsDescribedBy, HasPart, IsCalibratedBy).
       Unlike sample templates, instrument templates have no default unit.
     Returns: Created instrument template including its global ID (NT...)
     """
@@ -1642,10 +1706,17 @@ def create_instrument_from_template(
 
       Value format by field type:
         String / Text / Number   →  plain value          e.g. {"Serial Number": "SN-1234"}
-        Date                     →  ISO 8601 string      e.g. {"Last serviced": "2024-03-15"}
+        Date / Time              →  ISO 8601 string      e.g. {"Last serviced": "2024-03-15"}
         Uri                      →  URL string           e.g. {"Manual": "https://example.com/manual.pdf"}
         Radio                    →  single string from the allowed options
         Choice                   →  list of strings from the allowed options
+        Link                     →  a dict pointing at another record, with a typed relationship
+                                     {"relationType": <type>, "targetGlobalId": <global id>}
+                                     e.g. {"Calibrated by": {"relationType": "IsCalibratedBy", "targetGlobalId": "IN12"}}
+                                     Optional "versionPin" (int) pins the link to a target version.
+                                     relationType must be one of the field's allowedRelationTypes (from
+                                     get_instrument_template). A Link field is NOT a plain URL — use a Uri
+                                     field for external links.
 
       If any mandatory fields are omitted, the tool returns an error listing the missing
       fields (names, types, and allowed options where applicable) — re-call with those
@@ -1702,6 +1773,7 @@ def create_instrument_from_template(
     # are sent as {} (or {"id": ...}), leaving the value blank.
     #   Radio  -> {"selectedOptions": [value]}
     #   Choice -> {"selectedOptions": value}   (single string auto-wrapped)
+    #   Link   -> {"link": {"relationType": ..., "targetGlobalId": ...}}   typed record link
     #   Date/Time/String/Number/Uri/… -> {"content": str(value)}
     fields_payload = []
     for tf in template_fields:
@@ -1715,6 +1787,8 @@ def create_instrument_from_template(
                 entry["selectedOptions"] = [str(value)]
             elif field_type == "choice":
                 entry["selectedOptions"] = value if isinstance(value, list) else [str(value)]
+            elif field_type == "link":
+                entry["link"] = _build_link_field_value(tf["name"], value)
             else:
                 entry["content"] = str(value)
         fields_payload.append(entry)
@@ -1790,21 +1864,39 @@ def add_extra_fields_to_item(item_id: Union[int, str], field_data: List[dict]) -
     Adds custom metadata fields to inventory items
     
     Usage: Extend items with experiment-specific or project-specific data
-    Field format: [{"name": "Field Name", "type": "text|number", "content": "value"}]
-    Types: 'text' for strings, 'number' for numeric values
-    
+    Field format: [{"name": "Field Name", "type": "text|number|link", "content": "value"}]
+    Types:
+      'text'   → 'content' holds a string
+      'number' → 'content' holds a numeric value
+      'link'   → instead of 'content', supply 'relationType' and 'targetGlobalId'
+                 (and optional 'versionPin') to point at another record, e.g.
+                 {"name": "Derived from", "type": "link",
+                  "relationType": "IsDerivedFrom", "targetGlobalId": "SA84"}
+                 A link is a typed relationship to an RSpace record, not a URL.
+
     Returns: Updated item with new custom fields
     """
     type_map = {"text": i.ExtraFieldType.TEXT, "number": i.ExtraFieldType.NUMBER}
     extra_fields = []
     for field in field_data:
         raw_type = str(field.get('type', 'text')).lower()
-        if raw_type not in type_map:
+        if raw_type == "link":
+            relation = field.get("relationType", field.get("relation_type"))
+            target = field.get("targetGlobalId", field.get("target_global_id"))
+            version = field.get("versionPin", field.get("version_pin"))
+            if not relation or not target:
+                raise ValueError(
+                    f"Link extra field {field.get('name')!r} requires 'relationType' and "
+                    f"'targetGlobalId'; got {field!r}"
+                )
+            ef = i.ExtraField.link(field['name'], relation, target, version)
+        elif raw_type in type_map:
+            ef = i.ExtraField(field['name'], type_map[raw_type], field.get('content', ''))
+        else:
             raise ValueError(
                 f"Unknown extra field type {raw_type!r} for field "
-                f"{field.get('name')!r}; must be one of {sorted(type_map)}"
+                f"{field.get('name')!r}; must be one of {sorted(type_map) + ['link']}"
             )
-        ef = i.ExtraField(field['name'], type_map[raw_type], field.get('content', ''))
         extra_fields.append(ef)
 
     return inv_cli.add_extra_fields(item_id, *extra_fields)
