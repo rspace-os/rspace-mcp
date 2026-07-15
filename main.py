@@ -174,7 +174,7 @@ def update_document(
     document_id: int | str,
     name: str = None,
     tags: List[str] = None,
-    form_id: int | str = None,
+    form_id: int | str | None = None,
     fields: List[dict] = None
 ) -> dict:
     """
@@ -564,11 +564,20 @@ def create_form(
     [
         {
             "name": "Field Name",
-            "type": "String|Text|Number|Radio|Date|Choice", 
+            "type": "String|Text|Number|Radio|Date|Choice",
             "mandatory": True/False,
             "defaultValue": "optional default"
         }
     ]
+    Field types are capitalised here (String, Text, Number, Radio, Date, Choice),
+    unlike instrument/sample templates which use lowercase type names.
+
+    Radio and Choice fields REQUIRE a flat "options" list on the field, e.g.
+        {"name": "Imaging Mode", "type": "Radio", "mandatory": False,
+         "options": ["Bright Field", "Dark Field", "HAADF-STEM"]}
+    Note this differs from create_instrument_template, whose radio/choice options
+    are nested under "definition": {"options": [...]}. Omitting "options" on a
+    Radio/Choice field fails with "Please provide at least one option".
     Returns: Created form information (form will be in NEW state)
     """
     return eln_cli.create_form(name=name, tags=tags, fields=fields)
@@ -635,7 +644,7 @@ def delete_form(form_id: int | str) -> dict:
 def create_document_from_form(
     form_id: int | str,
     name: str = None,
-    parent_folder_id: int | str = None,
+    parent_folder_id: int | str | None = None,
     tags: List[str] = None,
     fields: List[dict] = None
 ) -> dict:
@@ -809,6 +818,59 @@ def uploadAndAttachFile(
 # ==================== SAMPLE MANAGEMENT ====================
 # Core sample creation, retrieval, and manipulation tools
 
+def _normalise_inventory_tags(tags: List[Any]) -> List[dict]:
+    """Wrap plain-string tags into the ApiTagInfo dict shape the inventory API
+    requires. Dicts (already {"value": ...}) are passed through unchanged, so a
+    mix of strings and dicts is tolerated. Mirrors i.gen_tags for the string case.
+    """
+    normalised = []
+    for tag in tags:
+        if isinstance(tag, str):
+            normalised.append({
+                "value": tag,
+                "ontologyName": None,
+                "ontologyVersion": None,
+                "uri": None,
+            })
+        else:
+            normalised.append(tag)
+    return normalised
+
+
+def _resolve_quantity_unit(label: str) -> dict:
+    """Look up a quantity unit definition, tolerant of casing.
+
+    The client's QuantityUnit.of does an exact, case-sensitive match, so common
+    abbreviations like "L" or "mL" are rejected even though "l"/"ml" exist. We
+    try the exact match first (so uppercase-only units C/K/F still resolve),
+    then fall back to a case-insensitive match before giving up with a message
+    that lists the accepted units.
+    """
+    from rspace_client.inv import quantity_unit as qu
+    if qu.QuantityUnit.is_supported_unit(label):
+        return qu.QuantityUnit.of(label)
+    lowered = label.lower()
+    for candidate in qu.QuantityUnit.unit_labels():
+        if candidate.lower() == lowered:
+            return qu.QuantityUnit.of(candidate)
+    raise ValueError(
+        f"'{label}' is not a recognised unit. Valid units: "
+        f"{', '.join(qu.QuantityUnit.unit_labels())}."
+    )
+
+
+def _unit_dimension(unit_id: Any) -> Optional[str]:
+    """Map a numeric unit id (e.g. a template's defaultUnitId) to its
+    human-readable dimension/category (mass, volume, temperature, ...).
+    Returns None if the id is unknown.
+    """
+    from rspace_client.inv import quantity_unit as qu
+    for unit in qu.QuantityUnit.data:
+        if unit["id"] == unit_id:
+            return unit["category"]
+    return None
+
+
 @mcp.tool(tags={"rspace", "inventory", "samples"})
 def create_sample(
     name: str,
@@ -831,8 +893,7 @@ def create_sample(
     
     quantity = None
     if total_quantity_value:
-        from rspace_client.inv import quantity_unit as qu
-        unit = qu.QuantityUnit.of(total_quantity_unit)
+        unit = _resolve_quantity_unit(total_quantity_unit)
         quantity = i.Quantity(total_quantity_value, unit)
     
     return inv_cli.create_sample(
@@ -1009,8 +1070,7 @@ def create_sample_from_template(
 
     quantity = None
     if total_quantity_value:
-        from rspace_client.inv import quantity_unit as qu
-        unit = qu.QuantityUnit.of(total_quantity_unit)
+        unit = _resolve_quantity_unit(total_quantity_unit)
         quantity = i.Quantity(total_quantity_value, unit)
 
     return inv_cli.create_sample(
@@ -1203,7 +1263,7 @@ def create_list_container(
     tags: List[str] = None,
     can_store_containers: bool = True,
     can_store_samples: bool = True,
-    parent_container_id: Union[int, str] = None
+    parent_container_id: Optional[Union[int, str]] = None
 ) -> dict:
     """
     Creates a simple list-based container for organizing inventory
@@ -1239,7 +1299,7 @@ def create_grid_container(
     tags: List[str] = None,
     can_store_containers: bool = True,
     can_store_samples: bool = True,
-    parent_container_id: Union[int, str] = None
+    parent_container_id: Optional[Union[int, str]] = None
 ) -> dict:
     """
     Creates a grid-based container with specific positioning
@@ -1277,7 +1337,7 @@ def create_image_container(
     tags: List[str] = None,
     can_store_containers: bool = True,
     can_store_samples: bool = True,
-    parent_container_id: Union[int, str] = None
+    parent_container_id: Optional[Union[int, str]] = None
 ) -> dict:
     """
     Creates an image-based container with marked locations on a background image
@@ -1564,9 +1624,18 @@ def get_sample_template(template_id: str) -> dict:
            fields, their types, and which are mandatory.
     Template ID: Use the global ID with the "IT" prefix, e.g. "IT12".
                  Use list_sample_templates to find global IDs.
-    Returns: Complete template definition including field specifications
+    Returns: Complete template definition including field specifications. When the
+             template tracks quantity, the result is enriched with a readable
+             "defaultUnitDimension" (e.g. "mass", "volume") alongside the opaque
+             numeric "defaultUnitId", so callers know which unit dimension
+             create_sample_from_template must use for this template.
     """
-    return inv_cli.get_sample_template_by_id(template_id)
+    template = inv_cli.get_sample_template_by_id(template_id)
+    if isinstance(template, dict) and template.get("defaultUnitId") is not None:
+        dimension = _unit_dimension(template["defaultUnitId"])
+        if dimension is not None:
+            template["defaultUnitDimension"] = dimension
+    return template
 
 
 @mcp.tool(tags={"rspace", "inventory", "templates"})
@@ -1603,7 +1672,7 @@ def create_instrument_template(template_data: dict) -> dict:
                        {"name": "Calibration", "type": "number"}]}
       Supported field types: string, text, number, date, time, radio, choice,
       attachment, uri, link. Radio/choice fields take a "definition": {"options": [...]}.
-      A link field defines a typed relationship to another record (not a URL — use
+      A link field defines a typed relationship to another record (not a URL, use
       uri for URLs). It may optionally whitelist which relationships are allowed via
       "allowedRelationTypes", e.g.
         {"name": "Calibrated by", "type": "link",
@@ -1612,8 +1681,17 @@ def create_instrument_template(template_data: dict) -> dict:
       types come from the DataCite vocabulary plus IsCalibratedBy/Calibrates
       (e.g. References, IsDerivedFrom, IsDescribedBy, HasPart, IsCalibratedBy).
       Unlike sample templates, instrument templates have no default unit.
+
+      tags: optional list of tags. Plain strings are accepted and wrapped
+      automatically, e.g. "tags": ["microscopy"]. Objects of the form
+      {"value": "microscopy"} are also accepted and passed through unchanged.
     Returns: Created instrument template including its global ID (NT...)
     """
+    if isinstance(template_data, dict) and template_data.get("tags"):
+        # The inventory API rejects bare strings for tags (needs ApiTagInfo
+        # objects). Sample/container tools get this for free via i.gen_tags;
+        # this tool takes a raw dict, so normalise the tags here instead.
+        template_data = {**template_data, "tags": _normalise_inventory_tags(template_data["tags"])}
     return inv_cli.create_instrument_template(template_data)
 
 
@@ -1978,15 +2056,13 @@ def bulk_create_samples(sample_definitions: List[dict]) -> dict:
             f"samples per call (got {len(sample_definitions)})"
         )
 
-    from rspace_client.inv import quantity_unit as qu
-
     posts = []
     for idx, sd in enumerate(sample_definitions):
         if not sd.get("name"):
             raise ValueError(f"sample_definitions[{idx}] missing required 'name'")
         quantity = None
         if sd.get("total_quantity_value") is not None:
-            unit = qu.QuantityUnit.of(sd.get("total_quantity_unit", "ml"))
+            unit = _resolve_quantity_unit(sd.get("total_quantity_unit", "ml"))
             quantity = i.Quantity(sd["total_quantity_value"], unit)
         posts.append(i.SamplePost(
             name=sd["name"],
