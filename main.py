@@ -135,11 +135,17 @@ def status() -> str:
 # Core document operations - reading, creating, updating documents
 
 @mcp.tool(tags={"rspace"})
-def get_documents(page_size: int = 20, page_number: int = 0) -> list[Document]:
+def get_documents(query: str = None, page_size: int = 20, page_number: int = 0) -> list[Document]:
     """
-    Retrieves recent RSpace documents with pagination
+    Retrieves RSpace documents with pagination, optionally filtered by a search term
 
-    Usage: Get overview of recent documents for browsing/selection
+    Usage: Get an overview of documents for browsing/selection, or narrow the list
+      with a search term.
+    query: Optional free-text search term, behaving like RSpace's simple "All"
+      search (matches name, content, tags, and global ID). For example,
+      query="SD59540" returns just that document. Omit it to list recent documents.
+    Note: To fetch a single document's full content by ID, use
+      get_single_Rspace_document, which looks up an exact numeric or global ID.
     Limit: Maximum 200 documents per call for performance
     Pagination: page_number is 0-based; combine with page_size to walk results
     Returns: List of document metadata (not full content)
@@ -148,7 +154,7 @@ def get_documents(page_size: int = 20, page_number: int = 0) -> list[Document]:
         raise ValueError("page_size must be between 0 and 200")
     if page_number < 0:
         raise ValueError("page_number must be >= 0")
-    resp = eln_cli.get_documents(page_size=page_size, page_number=page_number)
+    resp = eln_cli.get_documents(query=query, page_size=page_size, page_number=page_number)
     return resp['documents']
 
 
@@ -1934,6 +1940,62 @@ def rename_inventory_item(item_id: Union[int, str], new_name: str) -> dict:
     Returns: Updated item information with new name
     """
     return inv_cli.rename(item_id, new_name)
+
+
+@mcp.tool(tags={"rspace", "inventory", "utility"})
+def update_inventory_item_tags(
+    item_id: Union[int, str],
+    tags: List[str],
+    mode: Literal["append", "replace"] = "append",
+) -> dict:
+    """
+    Adds or replaces tags on an existing inventory item.
+
+    Usage: Retag an item after creation. The create_* tools only accept tags at
+      creation time; this is the inventory-side counterpart to
+      tagDocumentOrNotebookEntry / remove_tags_from_document (which act on ELN
+      documents). Works with any inventory item type: samples, subsamples,
+      containers, sample templates, instruments, and instrument templates.
+
+    Parameters:
+    - item_id: global ID including its type prefix (SA/SS/IC/IT/IN/NT), e.g.
+      "SA123". A bare numeric ID is rejected because the type cannot be inferred.
+    - tags: tag values as plain strings, e.g. ["chemistry", "workshop"].
+    - mode:
+        "append"  (default) — add these tags to the item's existing ones,
+                    de-duplicated case-insensitively; existing tags are kept.
+        "replace" — overwrite the item's entire tag set with exactly these tags.
+
+    Returns: The updated item dict, including its full resulting tag set.
+    """
+    sid = i.Id(item_id)
+    if not hasattr(sid, "prefix") or sid.prefix not in i.Id.PREFIX_TO_API:
+        return {
+            "error": "invalid_item_id",
+            "message": (
+                f"item_id must be a global ID with a recognised inventory prefix "
+                f"(one of {sorted(i.Id.PREFIX_TO_API)}), e.g. 'SA123'. Got {item_id!r}."
+            ),
+        }
+
+    path = f"/{sid.get_api_endpoint()}/{sid.as_id()}"
+    desired = [t.strip() for t in tags if t and t.strip()]
+
+    if mode == "append":
+        current = inv_cli.retrieve_api_results(path)
+        existing = [t.get("value") for t in (current.get("tags") or []) if t.get("value")]
+        seen = {v.lower() for v in existing}
+        final_values = list(existing)
+        for v in desired:
+            if v.lower() not in seen:
+                final_values.append(v)
+                seen.add(v.lower())
+    else:  # replace
+        final_values = desired
+
+    return inv_cli.retrieve_api_results(
+        path, request_type="PUT", params={"tags": i.gen_tags(final_values)}
+    )
 
 
 @mcp.tool(tags={"rspace", "inventory", "utility"})
