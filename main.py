@@ -175,6 +175,21 @@ def get_document(doc_id: int | str) -> FullDocument:
     return resp
 
 
+@mcp.tool(tags={"rspace"}, name="deleteDocumentOrNotebookEntry")
+def delete_document(doc_id: int | str) -> dict:
+    """
+    Deletes (moves to trash) a document or notebook entry
+
+    Usage: Remove a document created in error or no longer needed. This is the
+      ELN counterpart to the inventory delete_* tools.
+    Parameters: doc_id can be numeric ID or global ID (e.g. "SD12345").
+    Behaviour: Soft-delete (trash); cannot be undone via this MCP.
+    Returns: A confirmation dict {"success": True, "deleted": <doc_id>}
+    """
+    eln_cli.delete_document(doc_id)
+    return {"success": True, "deleted": str(doc_id)}
+
+
 @mcp.tool(tags={"rspace"})
 def update_document(
     document_id: int | str,
