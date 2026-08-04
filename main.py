@@ -2225,25 +2225,39 @@ def get_list_of_materials(lom_id: int) -> dict:
 # do not refresh mid-session), so instead we keep the VISIBLE tool surface small
 # and STATIC, and route the long tail through one dispatcher tool:
 #
-#   * Directly exposed (always listed): the `core` reads and the `destructive`
-#     tools. Destructive stay direct so the client keeps a per-tool permission
-#     prompt for each delete rather than hiding them behind a generic call.
-#   * Everything else is registered but hidden. It is reached via rspace_invoke,
-#     which validates arguments against the real tool schema and runs the
-#     original, unchanged function. Discovery is list_rspace_tools; schemas come
-#     from describe_rspace_tool.
+#   * Directly exposed (always listed): the read-only `core` group. Reads are
+#     safe and common, so they need no extra step.
+#   * Everything that changes state (create/update, and the deletes) is
+#     registered but hidden and reached via rspace_invoke, which validates
+#     arguments against the real tool schema and runs the original, unchanged
+#     function. So a mutation is always a deliberate discover-then-invoke rather
+#     than a high-consequence tool sitting in the always-visible list. Deletes
+#     additionally require confirm=true. Discovery is list_rspace_tools; schemas
+#     come from describe_rspace_tool.
 #
 # Because the listed set never changes, no tools/list_changed notification is
 # needed and it behaves identically on every MCP client. Tool NAMES are
 # unchanged, so skills that describe capabilities in natural language keep
 # working. RSPACE_DIRECT_TOOLSETS can promote extra groups to direct exposure.
 
+# Groups are split read vs mutation. `core` holds every read-only tool and is the
+# only group listed directly; all state-changing tools (create/update, and the
+# deletes in `destructive`) are hidden and reached via rspace_invoke, so a
+# mutation is always a deliberate discover-then-invoke, never a tool sitting in
+# the always-visible list. Each tool belongs to exactly one group.
 TOOLSETS: Dict[str, List[str]] = {
-    "core": [
+    "core": [  # read-only; the only directly-listed group
         "status", "get_documents", "search_documents", "get_single_Rspace_document",
-        "get_sample", "list_samples", "list_subsamples", "search_inventory",
-        "get_container", "list_containers", "get_workbenches",
-        "get_container_summary", "get_recent_samples_summary",
+        "get_form", "get_forms",
+        "get_sample", "get_subsample", "list_samples", "list_subsamples",
+        "search_inventory", "get_recent_samples_summary",
+        "get_container", "get_container_summary", "get_container_contents_only",
+        "list_containers", "get_workbenches",
+        "get_sample_template", "list_sample_templates",
+        "get_instrument", "list_instruments",
+        "get_instrument_template", "list_instrument_templates",
+        "get_list_of_materials", "get_lists_of_materials_for_document",
+        "get_lists_of_materials_for_field", "getAuditEvents",
     ],
     "eln-docs": [
         "update_document", "createNewNotebook", "createNotebookEntry",
@@ -2251,34 +2265,30 @@ TOOLSETS: Dict[str, List[str]] = {
         "remove_tags_from_document", "renameDocumentOrNotebookEntry",
     ],
     "eln-forms": [
-        "get_form", "get_forms", "create_form", "publish_form",
-        "unpublish_form", "share_form", "unshare_form",
+        "create_form", "publish_form", "unpublish_form", "share_form", "unshare_form",
     ],
     "inventory-write": [
         "create_sample", "create_sample_from_template", "bulk_create_samples",
         "duplicate_sample", "split_subsample", "add_note_to_subsample",
-        "get_subsample", "rename_inventory_item", "update_inventory_item_tags",
+        "rename_inventory_item", "update_inventory_item_tags",
         "add_extra_fields_to_item", "generate_barcode", "set_item_image",
     ],
     "inventory-containers": [
         "create_list_container", "create_grid_container", "create_image_container",
-        "add_image_container_locations", "get_container_contents_only",
+        "add_image_container_locations",
         "move_items_to_list_container", "move_items_to_grid_container_by_row",
         "move_items_to_grid_container_by_column",
         "move_items_to_specific_grid_locations", "move_items_to_image_container",
     ],
     "inventory-templates": [
-        "create_sample_template", "get_sample_template", "list_sample_templates",
+        "create_sample_template",
     ],
     "instruments": [
-        "create_instrument", "create_instrument_from_template", "get_instrument",
-        "list_instruments", "create_instrument_template",
-        "get_instrument_template", "list_instrument_templates",
+        "create_instrument", "create_instrument_from_template",
+        "create_instrument_template",
     ],
     "files-lom": [
         "uploadAndAttachFile", "downloadFile", "create_list_of_materials",
-        "get_list_of_materials", "get_lists_of_materials_for_document",
-        "get_lists_of_materials_for_field", "getAuditEvents",
     ],
     "destructive": [
         "delete_container", "delete_sample", "delete_subsample", "delete_form",
@@ -2288,19 +2298,22 @@ TOOLSETS: Dict[str, List[str]] = {
 }
 
 TOOLSET_DESCRIPTIONS: Dict[str, str] = {
-    "core": "Always on: status plus document and inventory search/reads.",
+    "core": "Read-only: status, search, and get/list across documents, forms, inventory, instruments, and the audit trail.",
     "eln-docs": "Author ELN documents and notebooks: create/update, tag, rename.",
-    "eln-forms": "Create and manage RSpace Forms and their sharing/publishing.",
-    "inventory-write": "Register and modify samples/subsamples: create, split, note, tag, barcode.",
+    "eln-forms": "Create, publish, and share RSpace Forms.",
+    "inventory-write": "Register and modify samples/subsamples: create, split, note, tag, barcode, image.",
     "inventory-containers": "Create containers and move items between storage locations.",
-    "inventory-templates": "Create and inspect sample templates.",
-    "instruments": "Manage instruments and instrument templates.",
-    "files-lom": "Upload/download attachments, lists of materials, and the audit trail.",
+    "inventory-templates": "Create sample templates.",
+    "instruments": "Create instruments and instrument templates.",
+    "files-lom": "Upload and download files; create lists of materials.",
     "destructive": "Delete (trash) documents, samples, containers, forms, and templates.",
 }
 
 # Groups whose tools are listed directly (callable without the dispatcher).
-_DEFAULT_DIRECT_GROUPS = {"core", "destructive"}
+# Only the read-only `core` group; everything that changes state goes via invoke.
+_DEFAULT_DIRECT_GROUPS = {"core"}
+# Mutations behind this group additionally require confirm=true in rspace_invoke.
+_CONFIRM_REQUIRED_GROUPS = {"destructive"}
 _DISPATCHER_TOOL_NAMES = {"list_rspace_tools", "describe_rspace_tool", "rspace_invoke"}
 
 # name -> group (each tool belongs to exactly one group).
@@ -2403,9 +2416,13 @@ async def rspace_invoke(tool_name: str, arguments: dict = None) -> Any:
     Validates arguments against the tool's real schema and runs the original
     function, returning its normal result. If you are unsure of the parameters,
     call describe_rspace_tool([tool_name]) first.
+
+    Destructive tools (the delete_* operations) additionally require
+    confirm=true in arguments, so a deletion is always a deliberate second step.
     Parameters:
       tool_name: the tool to run (from list_rspace_tools / describe_rspace_tool).
       arguments: dict of arguments for that tool (omit or {} if it takes none).
+        For a destructive tool, include confirm=true alongside its parameters.
     Returns: the target tool's own return value.
     """
     tools = _tools_by_name()
@@ -2416,8 +2433,15 @@ async def rspace_invoke(tool_name: str, arguments: dict = None) -> Any:
         raise ValueError(
             f"Unknown tool '{tool_name}'. Use list_rspace_tools to see available tools."
         )
+    args = dict(arguments or {})
+    if _GROUP_OF.get(tool_name) in _CONFIRM_REQUIRED_GROUPS and not args.pop("confirm", False):
+        raise ValueError(
+            f"'{tool_name}' is destructive (it trashes data). Verify the target id, "
+            f"then re-call rspace_invoke with confirm=true in arguments to proceed."
+        )
+    args.pop("confirm", None)  # synthetic dispatcher flag, not a tool parameter
     try:
-        result = await tool.run(arguments or {})
+        result = await tool.run(args)
     except Exception as exc:
         # Surface a corrective message (e.g. schema validation) rather than
         # failing opaquely, so the model can fix the call and retry.
@@ -2484,9 +2508,9 @@ if __name__ == "__main__":
     
     Deployment:
     - Ensure RSPACE_API_KEY and RSPACE_URL environment variables are set
-    - Only the core and destructive tools are listed directly; the rest are run
-      via rspace_invoke (see the TOOL DISPATCHER section). RSPACE_DIRECT_TOOLSETS
-      promotes extra groups to direct exposure.
+    - Only the read-only core tools are listed directly; state-changing tools
+      (including deletes) are run via rspace_invoke (see the TOOL DISPATCHER
+      section). RSPACE_DIRECT_TOOLSETS promotes extra groups to direct exposure.
     - Use appropriate tags for tool categorization and discovery
     """
     mcp.run()
