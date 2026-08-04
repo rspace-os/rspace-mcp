@@ -112,6 +112,72 @@ def _bulk_result(result) -> dict:
 
 
 # ============================================================================
+# RESPONSE SHAPING - Trim heavy RSpace payloads before they reach the model
+# ============================================================================
+# RSpace (esp. the Inventory API) returns HATEOAS `_links`, self-referential
+# `_class` hints, and other bookkeeping on every object and nested object. The
+# model never needs these, but they can be the majority of a response's tokens.
+# `_strip_noise` removes them recursively; `_slim_records` projects list rows to
+# a compact, predictable shape. Every shaped tool keeps a `verbose` escape hatch
+# so the full payload is still one call away when genuinely needed.
+
+# Bookkeeping keys that carry no information the model can act on.
+_NOISE_KEYS = {"_links", "links", "_class"}
+
+# Fields worth keeping when summarising an inventory list row.
+_INVENTORY_SUMMARY_FIELDS = (
+    "id", "globalId", "name", "type", "cType", "tags", "quantity",
+    "created", "lastModified", "modificationDate", "creationDate", "owner",
+)
+
+
+def _strip_noise(obj: Any) -> Any:
+    """Recursively drop HATEOAS/bookkeeping keys from a JSON-like structure."""
+    if isinstance(obj, dict):
+        return {k: _strip_noise(v) for k, v in obj.items() if k not in _NOISE_KEYS}
+    if isinstance(obj, list):
+        return [_strip_noise(v) for v in obj]
+    return obj
+
+
+def _summary_owner(value: Any) -> Any:
+    """Reduce an owner object to its username; leave other shapes untouched."""
+    if isinstance(value, dict):
+        return value.get("username") or value.get("id")
+    return value
+
+
+def _slim_records(payload: dict, fields=_INVENTORY_SUMMARY_FIELDS) -> dict:
+    """Project each row of a paginated inventory listing to `fields`.
+
+    Preserves paging metadata (totalHits, pageNumber, ...) and the container
+    key ('containers'/'samples'/'subSamples'/'templates'/'records'), replacing
+    only the heavy per-row objects with compact summaries.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    row_key = next(
+        (k for k in ("containers", "samples", "subSamples", "records",
+                     "templates", "instruments") if isinstance(payload.get(k), list)),
+        None,
+    )
+    if row_key is None:
+        return _strip_noise(payload)
+    slim_rows = []
+    for row in payload[row_key]:
+        if not isinstance(row, dict):
+            slim_rows.append(row)
+            continue
+        summary = {k: row[k] for k in fields if k in row}
+        if "owner" in summary:
+            summary["owner"] = _summary_owner(summary["owner"])
+        slim_rows.append(summary)
+    out = {k: v for k, v in payload.items() if k != row_key and k not in _NOISE_KEYS}
+    out[row_key] = slim_rows
+    return out
+
+
+# ============================================================================
 # ELECTRONIC LAB NOTEBOOK (ELN) TOOLS
 # ============================================================================
 # This section contains all tools related to documents, notebooks, forms, and
@@ -217,227 +283,85 @@ def update_document(
 @mcp.tool(tags={"rspace", "search"})
 def search_documents(
     query: str,
-    search_type: Literal["simple", "advanced"] = "simple",
-    query_types: List[Literal["global", "fullText", "tag", "name", "created", "lastModified", "form", "attachment"]] = None,
+    search_in: List[Literal["global", "fullText", "tag", "name", "created", "lastModified", "form", "attachment"]] = None,
     operator: Literal["and", "or"] = "and",
+    modified_within_days: int = None,
     order_by: str = "lastModified desc",
     page_number: int = 0,
     page_size: int = 20,
-    include_content: bool = False
+    include_content: bool = False,
 ) -> dict:
     """
-    Generic search tool for RSpace documents with flexible search options
-    
-    Usage: Search across all your RSpace documents using various criteria
-    
-    Parameters:
-    - query: The search term(s) to look for
-    - search_type: "simple" for basic search, "advanced" for multi-criteria search
-    - query_types: List of search types to use (for advanced search):
-        - "global": Search across all document content and metadata
-        - "fullText": Search within document text content
-        - "tag": Search by document tags
-        - "name": Search by document names/titles
-        - "created": Search by creation date (use ISO format like "2024-01-01")
-        - "lastModified": Search by modification date
-        - "form": Search by form type
-        - "attachment": Search by attachments
-    - operator: "and" (all criteria must match) or "or" (any criteria can match)
-    - order_by: Sort results by field (e.g., "lastModified desc", "name asc")
-    - page_number: Page number for pagination (0-based)
-    - page_size: Number of results per page (max 200)
-    - include_content: Whether to fetch full document content (slower but more complete)
-    
-    Returns: Dictionary with search results and metadata
-    
-    Examples:
-    - Simple text search: search_documents("PCR protocol")
-    - Search by tags: search_documents("experiment", search_type="advanced", query_types=["tag"])
-    - Multi-criteria search: search_documents("DNA", search_type="advanced", 
-                                            query_types=["fullText", "tag"], operator="or")
+    Unified search for RSpace ELN documents. Covers plain text, tags, full-text
+    content, names, forms, attachments, and recency in one tool.
+
+    query: term(s) to match. Multiple whitespace-separated terms are combined
+      with `operator` (e.g. "PCR extraction" with operator="and").
+    search_in: which field(s) to match. Omit for a simple "All" search (name,
+      content, tags, global id). Provide one or more of global/fullText/tag/name/
+      created/lastModified/form/attachment for an advanced search. For a tag
+      search use ["tag"]; for content use ["fullText"].
+    operator: how multiple terms / search_in fields combine ("and" or "or").
+    modified_within_days: also restrict to documents modified in the last N days.
+    order_by: e.g. "lastModified desc", "name asc".
+    include_content: also fetch each hit's full text. Capped at page_size <= 25
+      because each hit triggers one extra fetch.
+    Returns: {documents: [...], totalHits, ...}. To read one document's full
+      content by id use get_single_Rspace_document.
     """
     if page_size > 200:
         raise ValueError("page_size must be 200 or less")
-    # include_content fetches each matched document one-by-one (N+1 HTTP calls).
-    # Cap it to a reasonable batch so a careless call can't fan out to 200 fetches.
     if include_content and page_size > 25:
         raise ValueError(
             "include_content=True is limited to page_size <= 25 because each "
             "result triggers an extra fetch. Lower page_size or paginate."
         )
 
-    if search_type == "simple":
-        # Use simple search - works like RSpace's "All" search
+    terms = [t for t in (query or "").split() if t] or ([query] if query else [])
+    use_advanced = bool(search_in) or modified_within_days is not None
+
+    if not use_advanced:
+        # Simple "All" search, matching RSpace's default search behaviour.
         results = eln_cli.get_documents(
-            query=query,
-            order_by=order_by,
-            page_number=page_number,
-            page_size=page_size
+            query=query, order_by=order_by,
+            page_number=page_number, page_size=page_size,
         )
     else:
-        # Use advanced search with AdvancedQueryBuilder
-        if query_types is None:
-            query_types = ["global"]  # Default to global search
-        
+        qt = {
+            "global": AdvancedQueryBuilder.QueryType.GLOBAL,
+            "fullText": AdvancedQueryBuilder.QueryType.FULL_TEXT,
+            "tag": AdvancedQueryBuilder.QueryType.TAG,
+            "name": AdvancedQueryBuilder.QueryType.NAME,
+            "created": AdvancedQueryBuilder.QueryType.CREATED,
+            "lastModified": AdvancedQueryBuilder.QueryType.LAST_MODIFIED,
+            "form": AdvancedQueryBuilder.QueryType.FORM,
+            "attachment": AdvancedQueryBuilder.QueryType.ATTACHMENT,
+        }
         builder = AdvancedQueryBuilder(operator=operator)
-        
-        # Add search terms for each specified query type
-        for query_type in query_types:
-            if query_type == "global":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.GLOBAL)
-            elif query_type == "fullText":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.FULL_TEXT)
-            elif query_type == "tag":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.TAG)
-            elif query_type == "name":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.NAME)
-            elif query_type == "created":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.CREATED)
-            elif query_type == "lastModified":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.LAST_MODIFIED)
-            elif query_type == "form":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.FORM)
-            elif query_type == "attachment":
-                builder.add_term(query, AdvancedQueryBuilder.QueryType.ATTACHMENT)
-        
-        advanced_query = builder.get_advanced_query()
+        for field in (search_in or ["global"]):
+            for term in terms:
+                builder.add_term(term, qt[field])
+        if modified_within_days is not None:
+            from datetime import datetime, timedelta
+            start = (datetime.now() - timedelta(days=modified_within_days)).strftime("%Y-%m-%d")
+            end = datetime.now().strftime("%Y-%m-%d")
+            builder.add_term(f"{start};{end}", AdvancedQueryBuilder.QueryType.LAST_MODIFIED)
         results = eln_cli.get_documents_advanced_query(
-            advanced_query=advanced_query,
-            order_by=order_by,
-            page_number=page_number,
-            page_size=page_size
+            advanced_query=builder.get_advanced_query(),
+            order_by=order_by, page_number=page_number, page_size=page_size,
         )
-    
-    # Optionally fetch full content for each document
-    if include_content and 'documents' in results:
-        for doc in results['documents']:
+
+    if include_content and isinstance(results, dict) and "documents" in results:
+        for doc in results["documents"]:
             try:
-                full_doc = eln_cli.get_document(doc['globalId'])
-                # Add concatenated content to the document
-                content = ''
-                for field in full_doc.get('fields', []):
-                    content += field.get('content', '')
-                doc['fullContent'] = content
-            except Exception as e:
-                doc['fullContent'] = f"Error fetching content: {str(e)}"
-    
+                full_doc = eln_cli.get_document(doc["globalId"])
+                doc["fullContent"] = "".join(
+                    f.get("content", "") for f in full_doc.get("fields", [])
+                )
+            except Exception as exc:
+                doc["fullContent"] = f"Error fetching content: {exc}"
+
     return results
-
-
-@mcp.tool(tags={"rspace", "search"})
-def search_by_tags(
-    tags: List[str],
-    operator: Literal["and", "or"] = "and",
-    order_by: str = "lastModified desc", 
-    page_number: int = 0,
-    page_size: int = 20
-) -> dict:
-    """
-    Search documents by specific tags
-    
-    Usage: Find documents tagged with specific keywords
-    
-    Parameters:
-    - tags: List of tags to search for
-    - operator: "and" (document must have all tags) or "or" (document can have any tag)
-    - order_by: Sort results by field
-    - page_number: Page number for pagination
-    - page_size: Number of results per page
-    
-    Returns: Dictionary with search results
-    
-    Example: search_by_tags(["PCR", "protocol"], operator="and")
-    """
-    builder = AdvancedQueryBuilder(operator=operator)
-    
-    for tag in tags:
-        builder.add_term(tag, AdvancedQueryBuilder.QueryType.TAG)
-    
-    advanced_query = builder.get_advanced_query()
-    return eln_cli.get_documents_advanced_query(
-        advanced_query=advanced_query,
-        order_by=order_by,
-        page_number=page_number,
-        page_size=page_size
-    )
-
-
-@mcp.tool(tags={"rspace", "search"})
-def search_recent_documents(
-    days_back: int = 7,
-    query: str = None,
-    page_size: int = 20
-) -> dict:
-    """
-    Search for recently modified documents
-    
-    Usage: Find documents modified within a specific timeframe
-    
-    Parameters:
-    - days_back: Number of days to look back
-    - query: Optional text search within recent documents
-    - page_size: Number of results to return
-    
-    Returns: Dictionary with recent documents
-    
-    Example: search_recent_documents(7, "experiment")
-    """
-    from datetime import datetime, timedelta
-    
-    # Calculate date range - RSpace expects "startDate;endDate" format for date ranges
-    start_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    date_range = f"{start_date};{end_date}"
-    
-    builder = AdvancedQueryBuilder(operator="and")
-    builder.add_term(date_range, AdvancedQueryBuilder.QueryType.LAST_MODIFIED)
-    
-    if query:
-        builder.add_term(query, AdvancedQueryBuilder.QueryType.GLOBAL)
-    
-    advanced_query = builder.get_advanced_query()
-    return eln_cli.get_documents_advanced_query(
-        advanced_query=advanced_query,
-        order_by="lastModified desc",
-        page_number=0,
-        page_size=page_size
-    )
-
-
-@mcp.tool(tags={"rspace", "search"})
-def find_documents_by_content(
-    content_terms: List[str],
-    operator: Literal["and", "or"] = "and",
-    order_by: str = "lastModified desc",
-    page_size: int = 20
-) -> dict:
-    """
-    Full-text content-based document search
-
-    Usage: Find documents containing specific content terms
-
-    Parameters:
-    - content_terms: List of terms that should appear in document content
-    - operator: "and" (all terms must appear) or "or" (any term can appear)
-    - order_by: Sort results by field
-    - page_size: Number of results to return
-
-    Returns: Dictionary with search results
-
-    Example: find_documents_by_content(["DNA", "extraction"], operator="and")
-    """
-    builder = AdvancedQueryBuilder(operator=operator)
-
-    for term in content_terms:
-        builder.add_term(term, AdvancedQueryBuilder.QueryType.FULL_TEXT)
-
-    advanced_query = builder.get_advanced_query()
-    return eln_cli.get_documents_advanced_query(
-        advanced_query=advanced_query,
-        order_by=order_by,
-        page_number=0,
-        page_size=page_size
-    )
 
 # ==================== NOTEBOOK OPERATIONS ====================
 # Specialized tools for notebook creation and entry management
@@ -1106,44 +1030,51 @@ def create_sample_from_template(
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
-def get_sample(sample_id: Union[int, str]) -> dict:
+def get_sample(sample_id: Union[int, str], verbose: bool = False) -> dict:
     """
     Retrieves complete information about a specific sample
-    
+
     Usage: Get detailed sample metadata, location, and subsample information
     Parameters: sample_id can be numeric ID or global ID (e.g., "SA12345")
+    verbose: keep raw HATEOAS `_links`/bookkeeping (default False strips them)
     Returns: Full sample details including all subsamples
     """
-    return inv_cli.get_sample_by_id(sample_id)
+    resp = inv_cli.get_sample_by_id(sample_id)
+    return resp if verbose else _strip_noise(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
-def get_subsample(subsample_id: Union[int, str]) -> dict:
+def get_subsample(subsample_id: Union[int, str], verbose: bool = False) -> dict:
     """
     Retrieves complete information about a specific subsample
 
     Usage: Inspect a single subsample's metadata, parent sample, and storage
     location without listing the whole sample
     Parameters: subsample_id can be numeric ID or global ID (e.g., "SS12345")
+    verbose: keep raw HATEOAS `_links`/bookkeeping (default False strips them)
     Returns: Full subsample details
     """
-    return inv_cli.get_subsample_by_id(subsample_id)
+    resp = inv_cli.get_subsample_by_id(subsample_id)
+    return resp if verbose else _strip_noise(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
 def list_subsamples(page_size: int = 20, page_number: int = 0,
-                    order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
+                    order_by: str = "modificationDate", sort_order: str = "desc",
+                    verbose: bool = False) -> dict:
     """
     Lists subsamples in the inventory with pagination and sorting
 
     Usage: Browse subsamples directly without traversing parent samples
     Sorting: order_by must be one of: name, type, globalId, creationDate,
              modificationDate. sort_order is "asc" or "desc".
+    verbose: return full rows (default False summarises each row)
     Returns: Paginated list of subsample metadata
     """
     pagination = i.Pagination(page_size=page_size, page_number=page_number,
                               order_by=order_by, sort_order=sort_order)
-    return inv_cli.list_subsamples(pagination)
+    resp = inv_cli.list_subsamples(pagination)
+    return resp if verbose else _slim_records(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
@@ -1204,18 +1135,21 @@ def delete_sample_template(template_id: Union[int, str]) -> dict:
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
 def list_samples(page_size: int = 20, page_number: int = 0,
-                 order_by: str = "modificationDate", sort_order: str = "desc") -> dict:
+                 order_by: str = "modificationDate", sort_order: str = "desc",
+                 verbose: bool = False) -> dict:
     """
     Lists samples in the inventory with pagination and sorting
 
     Usage: Browse sample collection, find recent additions
     Sorting: order_by must be one of: name, type, globalId, creationDate,
              modificationDate. sort_order is "asc" or "desc".
+    verbose: return full rows (default False summarises each row)
     Returns: Paginated list of sample metadata
     """
     pagination = i.Pagination(page_size=page_size, page_number=page_number,
                               order_by=order_by, sort_order=sort_order)
-    return inv_cli.list_samples(pagination)
+    resp = inv_cli.list_samples(pagination)
+    return resp if verbose else _slim_records(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
@@ -1260,18 +1194,20 @@ def add_note_to_subsample(subsample_id: Union[int, str], note: str) -> dict:
 # Tools for finding inventory items across the system
 
 @mcp.tool(tags={"rspace", "inventory", "samples"})
-def search_inventory(query: str, result_type: str = None) -> dict:
+def search_inventory(query: str, result_type: str = None, verbose: bool = False) -> dict:
     """
     Searches across all inventory items using text query
-    
+
     Usage: Find samples, containers, or templates by name, tags, or description
     Result types: 'SAMPLE', 'SUBSAMPLE', 'CONTAINER', 'TEMPLATE' (or None for all)
+    verbose: return full rows (default False summarises each match)
     Returns: Matching items with relevance scoring
     """
     rt = None
     if result_type:
         rt = getattr(i.ResultType, result_type.upper(), None)
-    return inv_cli.search(query, result_type=rt)
+    resp = inv_cli.search(query, result_type=rt)
+    return resp if verbose else _slim_records(resp)
 
 
 # ==================== CONTAINER MANAGEMENT ====================
@@ -1443,40 +1379,46 @@ def set_item_image(item_id: Union[int, str], image_path: str) -> dict:
 
 
 @mcp.tool(tags={"rspace", "inventory", "containers"})
-def get_container(container_id: Union[int, str], include_content: bool = False) -> dict:
+def get_container(container_id: Union[int, str], include_content: bool = False, verbose: bool = False) -> dict:
     """
     Retrieves container information with optional content listing
-    
+
     Usage: Examine container properties and optionally see what's inside
     Performance: Set include_content=False for faster queries on large containers
+    verbose: keep raw HATEOAS `_links`/bookkeeping (default False strips them)
     Returns: Container details and optionally contained items
     """
-    return inv_cli.get_container_by_id(container_id, include_content)
+    resp = inv_cli.get_container_by_id(container_id, include_content)
+    return resp if verbose else _strip_noise(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "containers"})
-def list_containers(page_size: int = 20, page_number: int = 0) -> dict:
+def list_containers(page_size: int = 20, page_number: int = 0, verbose: bool = False) -> dict:
     """
     Lists top-level containers (not nested within other containers)
 
     Usage: Browse main container organization structure
     Pagination: page_number is 0-based
+    verbose: return full rows (default False summarises each row)
     Returns: Paginated list of root-level containers
     """
     pagination = i.Pagination(page_size=page_size, page_number=page_number)
-    return inv_cli.list_top_level_containers(pagination)
+    resp = inv_cli.list_top_level_containers(pagination)
+    return resp if verbose else _slim_records(resp)
 
 
 @mcp.tool(tags={"rspace", "inventory", "containers"})
-def get_workbenches() -> List[dict]:
+def get_workbenches(verbose: bool = False) -> List[dict]:
     """
     Retrieves all available workbenches (virtual workspaces)
-    
+
     Usage: Find available workspaces for organizing current work
     Workbenches: Special containers representing physical or logical workspaces
+    verbose: keep raw HATEOAS `_links`/bookkeeping (default False strips them)
     Returns: List of all workbench containers
     """
-    return inv_cli.get_workbenches()
+    resp = inv_cli.get_workbenches()
+    return resp if verbose else _strip_noise(resp)
 
 
 # ==================== ITEM MOVEMENT AND ORGANIZATION ====================
