@@ -27,6 +27,8 @@ Before relying on either reference file below, check whether it still reads "Exa
 
 Use the RSpace MCP server for interactive work: creating documents, forms, templates, registering samples, searching, updating records. If you need bulk operations, scripting, or batch exports, the RSpace CLI, Python SDK, or API are also available.
 
+The server may expose only a core set of tools (search and reads) by default and load the rest on demand. If a capability you need is not among the currently available tools, for example creating a form, registering or moving a sample, or deleting a record, call `list_toolsets` to see the groups and `load_toolset("<name>")` to switch the relevant one on. Its tools then become available to call.
+
 *[EDIT ME]* Add any other tool this agent should reach for, for example an instrument-control script, another MCP server (e.g. Dataverse, Galaxy), or a lab-specific data pipeline.
 
 ## Keeping things connected and FAIR

@@ -74,6 +74,20 @@ This is a proof-of-concept MCP server for RSpace that runs locally on your machi
       }
       ```
       
+### Controlling which tools are exposed (progressive disclosure)
+
+The server has a lot of tools, and every tool definition is sent to the model on every request, which costs context tokens. To keep that cost low, the server exposes only a lean **`core`** set (status, plus document and inventory search and reads) by default. The remaining tools are grouped into toolsets that the agent loads on demand by calling the `load_toolset` tool (with `list_toolsets` to discover them). Loading a group triggers an MCP `tools/list_changed` notification, so this needs a client that supports that (modern Claude clients do).
+
+Set the `RSPACE_TOOLSETS` environment variable (e.g. in your `.env` or the client `env` block) to change what is enabled at startup:
+
+| Value | Effect |
+| --- | --- |
+| _(unset)_ | `core` only (default) |
+| `all` or `*` | every tool, no progressive disclosure |
+| `inventory-write,inventory-containers` | `core` plus the listed groups |
+
+Groups: `core` (always on), `eln-docs`, `eln-forms`, `inventory-write`, `inventory-containers`, `inventory-templates`, `instruments`, `files-lom`, `destructive`. Tool names never change, so a group can always be loaded later without affecting how a tool is called.
+
 ## Using the RSpace through the MCP server
       
 Please bear in mind that this is a proof of concept and your production use case might require a more specific MCP server configured with specifically fine-tuned tools. The tools provided here in this prototype ...

@@ -23,8 +23,11 @@ from rspace_client.eln import eln as e  # Electronic Lab Notebook client
 from rspace_client.inv import inv as i  # Inventory Management client
 from rspace_client.eln.advanced_query_builder import AdvancedQueryBuilder
 import os
+import logging
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("rspace-mcp")
 
 # ============================================================================
 # PYDANTIC MODELS - Data Structure Definitions
@@ -2214,6 +2217,216 @@ def get_list_of_materials(lom_id: int) -> dict:
 
 
 # ============================================================================
+# PROGRESSIVE TOOL DISCLOSURE - toolset gating + on-demand loading
+# ============================================================================
+# Tool definitions are sent to the model on every request, so exposing all tools
+# at once is the dominant fixed-context cost. Instead we expose a lean, always-on
+# `core` set plus loader meta-tools; every other tool starts hidden and is
+# switched on by load_toolset(...), which fires an MCP tools/list_changed
+# notification so the client refreshes its tool list.
+#
+# Which groups are active at startup is controlled by the RSPACE_TOOLSETS env var
+# (comma-separated group names, or "all"); unset means core only. Requires a
+# client that honours tools/list_changed (modern Claude clients do). Tool NAMES
+# never change, so skills that describe capabilities in natural language keep
+# working: if a needed tool is not visible, the model calls load_toolset first.
+
+TOOLSETS: Dict[str, List[str]] = {
+    "core": [
+        "status", "get_documents", "search_documents", "get_single_Rspace_document",
+        "get_sample", "list_samples", "list_subsamples", "search_inventory",
+        "get_container", "list_containers", "get_workbenches",
+        "get_container_summary", "get_recent_samples_summary",
+    ],
+    "eln-docs": [
+        "update_document", "createNewNotebook", "createNotebookEntry",
+        "create_document_from_form", "tagDocumentOrNotebookEntry",
+        "remove_tags_from_document", "renameDocumentOrNotebookEntry",
+    ],
+    "eln-forms": [
+        "get_form", "get_forms", "create_form", "publish_form",
+        "unpublish_form", "share_form", "unshare_form",
+    ],
+    "inventory-write": [
+        "create_sample", "create_sample_from_template", "bulk_create_samples",
+        "duplicate_sample", "split_subsample", "add_note_to_subsample",
+        "get_subsample", "rename_inventory_item", "update_inventory_item_tags",
+        "add_extra_fields_to_item", "generate_barcode", "set_item_image",
+    ],
+    "inventory-containers": [
+        "create_list_container", "create_grid_container", "create_image_container",
+        "add_image_container_locations", "get_container_contents_only",
+        "move_items_to_list_container", "move_items_to_grid_container_by_row",
+        "move_items_to_grid_container_by_column",
+        "move_items_to_specific_grid_locations", "move_items_to_image_container",
+    ],
+    "inventory-templates": [
+        "create_sample_template", "get_sample_template", "list_sample_templates",
+    ],
+    "instruments": [
+        "create_instrument", "create_instrument_from_template", "get_instrument",
+        "list_instruments", "create_instrument_template",
+        "get_instrument_template", "list_instrument_templates",
+    ],
+    "files-lom": [
+        "uploadAndAttachFile", "downloadFile", "create_list_of_materials",
+        "get_list_of_materials", "get_lists_of_materials_for_document",
+        "get_lists_of_materials_for_field", "getAuditEvents",
+    ],
+    "destructive": [
+        "delete_container", "delete_sample", "delete_subsample", "delete_form",
+        "delete_sample_template", "delete_instrument", "delete_instrument_template",
+        "deleteDocumentOrNotebookEntry", "delete_image_container_locations",
+    ],
+}
+
+TOOLSET_DESCRIPTIONS: Dict[str, str] = {
+    "core": "Always on: status plus document and inventory search/reads.",
+    "eln-docs": "Author ELN documents and notebooks: create/update, tag, rename.",
+    "eln-forms": "Create and manage RSpace Forms and their sharing/publishing.",
+    "inventory-write": "Register and modify samples/subsamples: create, split, note, tag, barcode.",
+    "inventory-containers": "Create containers and move items between storage locations.",
+    "inventory-templates": "Create and inspect sample templates.",
+    "instruments": "Manage instruments and instrument templates.",
+    "files-lom": "Upload/download attachments, lists of materials, and the audit trail.",
+    "destructive": "Delete (trash) documents, samples, containers, forms, and templates.",
+}
+
+# `core` and the loader meta-tools are always available and cannot be unloaded.
+_ALWAYS_ON = {"core"}
+_META_TOOL_NAMES = {"list_toolsets", "load_toolset", "unload_toolset"}
+
+# name -> group (each tool belongs to exactly one group).
+_GROUP_OF: Dict[str, str] = {
+    name: group for group, names in TOOLSETS.items() for name in names
+}
+
+
+def _tools_by_name() -> Dict[str, Any]:
+    """Live registry of Tool objects (name -> Tool) for enable/disable at runtime."""
+    return mcp._tool_manager._tools
+
+
+def _active_groups_from_env() -> set:
+    """Groups enabled at startup. Unset/empty -> core only; 'all'/'*' -> every group."""
+    raw = (os.getenv("RSPACE_TOOLSETS") or "").strip()
+    if not raw:
+        return set(_ALWAYS_ON)
+    if raw.lower() in ("all", "*"):
+        return set(TOOLSETS)
+    requested = {g.strip() for g in raw.split(",") if g.strip()}
+    unknown = requested - set(TOOLSETS)
+    if unknown:
+        logger.warning("Ignoring unknown RSPACE_TOOLSETS group(s): %s",
+                       ", ".join(sorted(unknown)))
+    return (requested & set(TOOLSETS)) | set(_ALWAYS_ON)
+
+
+@mcp.tool(tags={"rspace", "core"})
+def list_toolsets() -> dict:
+    """
+    List the RSpace tool groups and whether each is currently loaded.
+
+    Use this whenever a capability you need is not among the available tools.
+    Switch a group on with load_toolset(name); its tools then appear to call.
+    `core` (search and reads) is always on.
+    Returns: {toolsets: [{name, description, tool_count, loaded}], hint}
+    """
+    tools = _tools_by_name()
+    out = []
+    for group, names in TOOLSETS.items():
+        present = [n for n in names if n in tools]
+        loaded = bool(present) and all(tools[n].enabled for n in present)
+        out.append({
+            "name": group,
+            "description": TOOLSET_DESCRIPTIONS.get(group, ""),
+            "tool_count": len(present),
+            "loaded": loaded,
+        })
+    return {"toolsets": out,
+            "hint": "Call load_toolset('<name>') to enable a group's tools."}
+
+
+@mcp.tool(tags={"rspace", "core"})
+def load_toolset(name: str) -> dict:
+    """
+    Enable a tool group so its tools become callable in this session.
+
+    After this returns, the client is notified that the tool list changed and the
+    newly enabled tools appear. The response also lists them so you can proceed
+    without waiting. Call list_toolsets() first if unsure of the name.
+    Parameters: name - a group from list_toolsets (e.g. "inventory-write").
+    Returns: {loaded, tools: [{name, description}]}
+    """
+    if name not in TOOLSETS:
+        raise ValueError(
+            f"Unknown toolset '{name}'. Available: {', '.join(sorted(TOOLSETS))}."
+        )
+    tools = _tools_by_name()
+    enabled = []
+    for tool_name in TOOLSETS[name]:
+        tool = tools.get(tool_name)
+        if tool is not None:
+            tool.enable()
+            first_line = (tool.description or "").strip().split("\n")[0]
+            enabled.append({"name": tool_name, "description": first_line[:120]})
+    return {"loaded": name, "tools": enabled}
+
+
+@mcp.tool(tags={"rspace", "core"})
+def unload_toolset(name: str) -> dict:
+    """
+    Disable a previously loaded tool group to reclaim context.
+
+    `core` and the loader tools stay on and cannot be unloaded.
+    Returns: {unloaded, tools: [names hidden]}
+    """
+    if name in _ALWAYS_ON:
+        raise ValueError(f"Toolset '{name}' is always on and cannot be unloaded.")
+    if name not in TOOLSETS:
+        raise ValueError(
+            f"Unknown toolset '{name}'. Available: {', '.join(sorted(TOOLSETS))}."
+        )
+    tools = _tools_by_name()
+    disabled = []
+    for tool_name in TOOLSETS[name]:
+        tool = tools.get(tool_name)
+        if tool is not None:
+            tool.disable()
+            disabled.append(tool_name)
+    return {"unloaded": name, "tools": disabled}
+
+
+def _configure_toolsets() -> None:
+    """Tag each tool with its group and set startup visibility from RSPACE_TOOLSETS."""
+    tools = _tools_by_name()
+    active = _active_groups_from_env()
+    ungrouped = []
+    for name, tool in tools.items():
+        if name in _META_TOOL_NAMES:
+            tool.enable()
+            continue
+        group = _GROUP_OF.get(name)
+        if group is None:
+            # Fail open: an unmapped tool (e.g. newly added) stays visible rather
+            # than being silently hidden.
+            tool.tags.add("ungrouped")
+            tool.enable()
+            ungrouped.append(name)
+            continue
+        tool.tags.add(group)
+        tool.enable() if group in active else tool.disable()
+    if ungrouped:
+        logger.warning("Tools not assigned to any toolset (left visible): %s",
+                       ", ".join(sorted(ungrouped)))
+    logger.info("Active RSpace toolsets: %s (set RSPACE_TOOLSETS to change, "
+                "'all' for everything).", ", ".join(sorted(active)))
+
+
+_configure_toolsets()
+
+
+# ============================================================================
 # SERVER EXECUTION
 # ============================================================================
 # This section handles the actual MCP server startup
@@ -2232,8 +2445,9 @@ if __name__ == "__main__":
     
     Deployment:
     - Ensure RSPACE_API_KEY and RSPACE_URL environment variables are set
-    - Server will automatically expose all registered tools to MCP clients
-    - Use appropriate tags for tool categorization and discovery
+    - By default only the `core` toolset is exposed; other tools load on demand
+      via load_toolset. Set RSPACE_TOOLSETS (e.g. "all") to change this.
+    - See the PROGRESSIVE TOOL DISCLOSURE section for the toolset map
     """
     mcp.run()
 
