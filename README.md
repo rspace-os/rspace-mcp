@@ -74,6 +74,29 @@ This is a proof-of-concept MCP server for RSpace that runs locally on your machi
       }
       ```
       
+### Keeping the context small (tool dispatcher)
+
+The server has a lot of tools, and every tool definition is sent to the model on every request, which costs context tokens. To keep that cost low, only two groups of tools are listed directly:
+
+- **`core`** — status plus document and inventory search and reads.
+- **`destructive`** — the delete tools, kept directly visible so your client still shows a per-tool permission prompt for each one.
+
+Every other tool is registered but hidden, and the model reaches it through three always-present dispatcher tools:
+
+- `list_rspace_tools(toolset)` — discover hidden tools and which group they are in.
+- `describe_rspace_tool(names)` — get the input schema for one or more tools.
+- `rspace_invoke(tool_name, arguments)` — run any tool by name; arguments are validated against the tool's real schema.
+
+Because the listed set never changes, this works on every MCP client (it does **not** rely on `tools/list_changed`, which Claude Desktop and the claude.ai connectors do not act on mid-session). Tool names are unchanged, so a skill can still refer to a capability by name; the model discovers and invokes it on demand.
+
+To expose more groups directly (skipping the dispatcher for them), set `RSPACE_DIRECT_TOOLSETS` in the client `env` block to a comma-separated list of groups, or `all` to list everything:
+
+```
+RSPACE_DIRECT_TOOLSETS=inventory-write,inventory-containers
+```
+
+Groups: `core` and `destructive` (always direct), plus `eln-docs`, `eln-forms`, `inventory-write`, `inventory-containers`, `inventory-templates`, `instruments`, `files-lom`.
+
 ## Using the RSpace through the MCP server
       
 Please bear in mind that this is a proof of concept and your production use case might require a more specific MCP server configured with specifically fine-tuned tools. The tools provided here in this prototype ...

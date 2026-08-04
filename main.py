@@ -23,8 +23,11 @@ from rspace_client.eln import eln as e  # Electronic Lab Notebook client
 from rspace_client.inv import inv as i  # Inventory Management client
 from rspace_client.eln.advanced_query_builder import AdvancedQueryBuilder
 import os
+import logging
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("rspace-mcp")
 
 # ============================================================================
 # PYDANTIC MODELS - Data Structure Definitions
@@ -2214,6 +2217,255 @@ def get_list_of_materials(lom_id: int) -> dict:
 
 
 # ============================================================================
+# TOOL DISPATCHER - static progressive disclosure that works on every client
+# ============================================================================
+# Tool definitions are sent to the model on every request, so exposing all tools
+# at once is the dominant fixed-context cost. Dynamic enable/disable via
+# tools/list_changed is unreliable (Claude Desktop and the claude.ai connectors
+# do not refresh mid-session), so instead we keep the VISIBLE tool surface small
+# and STATIC, and route the long tail through one dispatcher tool:
+#
+#   * Directly exposed (always listed): the `core` reads and the `destructive`
+#     tools. Destructive stay direct so the client keeps a per-tool permission
+#     prompt for each delete rather than hiding them behind a generic call.
+#   * Everything else is registered but hidden. It is reached via rspace_invoke,
+#     which validates arguments against the real tool schema and runs the
+#     original, unchanged function. Discovery is list_rspace_tools; schemas come
+#     from describe_rspace_tool.
+#
+# Because the listed set never changes, no tools/list_changed notification is
+# needed and it behaves identically on every MCP client. Tool NAMES are
+# unchanged, so skills that describe capabilities in natural language keep
+# working. RSPACE_DIRECT_TOOLSETS can promote extra groups to direct exposure.
+
+TOOLSETS: Dict[str, List[str]] = {
+    "core": [
+        "status", "get_documents", "search_documents", "get_single_Rspace_document",
+        "get_sample", "list_samples", "list_subsamples", "search_inventory",
+        "get_container", "list_containers", "get_workbenches",
+        "get_container_summary", "get_recent_samples_summary",
+    ],
+    "eln-docs": [
+        "update_document", "createNewNotebook", "createNotebookEntry",
+        "create_document_from_form", "tagDocumentOrNotebookEntry",
+        "remove_tags_from_document", "renameDocumentOrNotebookEntry",
+    ],
+    "eln-forms": [
+        "get_form", "get_forms", "create_form", "publish_form",
+        "unpublish_form", "share_form", "unshare_form",
+    ],
+    "inventory-write": [
+        "create_sample", "create_sample_from_template", "bulk_create_samples",
+        "duplicate_sample", "split_subsample", "add_note_to_subsample",
+        "get_subsample", "rename_inventory_item", "update_inventory_item_tags",
+        "add_extra_fields_to_item", "generate_barcode", "set_item_image",
+    ],
+    "inventory-containers": [
+        "create_list_container", "create_grid_container", "create_image_container",
+        "add_image_container_locations", "get_container_contents_only",
+        "move_items_to_list_container", "move_items_to_grid_container_by_row",
+        "move_items_to_grid_container_by_column",
+        "move_items_to_specific_grid_locations", "move_items_to_image_container",
+    ],
+    "inventory-templates": [
+        "create_sample_template", "get_sample_template", "list_sample_templates",
+    ],
+    "instruments": [
+        "create_instrument", "create_instrument_from_template", "get_instrument",
+        "list_instruments", "create_instrument_template",
+        "get_instrument_template", "list_instrument_templates",
+    ],
+    "files-lom": [
+        "uploadAndAttachFile", "downloadFile", "create_list_of_materials",
+        "get_list_of_materials", "get_lists_of_materials_for_document",
+        "get_lists_of_materials_for_field", "getAuditEvents",
+    ],
+    "destructive": [
+        "delete_container", "delete_sample", "delete_subsample", "delete_form",
+        "delete_sample_template", "delete_instrument", "delete_instrument_template",
+        "deleteDocumentOrNotebookEntry", "delete_image_container_locations",
+    ],
+}
+
+TOOLSET_DESCRIPTIONS: Dict[str, str] = {
+    "core": "Always on: status plus document and inventory search/reads.",
+    "eln-docs": "Author ELN documents and notebooks: create/update, tag, rename.",
+    "eln-forms": "Create and manage RSpace Forms and their sharing/publishing.",
+    "inventory-write": "Register and modify samples/subsamples: create, split, note, tag, barcode.",
+    "inventory-containers": "Create containers and move items between storage locations.",
+    "inventory-templates": "Create and inspect sample templates.",
+    "instruments": "Manage instruments and instrument templates.",
+    "files-lom": "Upload/download attachments, lists of materials, and the audit trail.",
+    "destructive": "Delete (trash) documents, samples, containers, forms, and templates.",
+}
+
+# Groups whose tools are listed directly (callable without the dispatcher).
+_DEFAULT_DIRECT_GROUPS = {"core", "destructive"}
+_DISPATCHER_TOOL_NAMES = {"list_rspace_tools", "describe_rspace_tool", "rspace_invoke"}
+
+# name -> group (each tool belongs to exactly one group).
+_GROUP_OF: Dict[str, str] = {
+    name: group for group, names in TOOLSETS.items() for name in names
+}
+
+
+def _tools_by_name() -> Dict[str, Any]:
+    """Live registry of Tool objects (name -> Tool)."""
+    return mcp._tool_manager._tools
+
+
+def _direct_groups() -> set:
+    """Groups exposed directly. RSPACE_DIRECT_TOOLSETS may add to the default."""
+    groups = set(_DEFAULT_DIRECT_GROUPS)
+    raw = (os.getenv("RSPACE_DIRECT_TOOLSETS") or "").strip()
+    if raw.lower() in ("all", "*"):
+        return set(TOOLSETS)
+    extra = {g.strip() for g in raw.split(",") if g.strip()}
+    unknown = extra - set(TOOLSETS)
+    if unknown:
+        logger.warning("Ignoring unknown RSPACE_DIRECT_TOOLSETS group(s): %s",
+                       ", ".join(sorted(unknown)))
+    return groups | (extra & set(TOOLSETS))
+
+
+def _first_line(text: str) -> str:
+    return (text or "").strip().split("\n")[0][:140]
+
+
+@mcp.tool(tags={"rspace", "dispatcher"})
+def list_rspace_tools(toolset: str = None) -> dict:
+    """
+    Discover RSpace tools that are not directly listed.
+
+    Many RSpace tools are hidden from the tool list to save context and are run
+    through rspace_invoke instead. Use this to find them, then describe_rspace_tool
+    for the schema, then rspace_invoke to run one.
+
+    Parameters:
+      toolset: optional group name to filter by (see the returned group names,
+        e.g. "inventory-write", "eln-forms"). Omit to list every group.
+    Returns: {toolsets: {group: [{name, summary, access}]}, hint}. access is
+      "direct" (already callable) or "invoke" (call via rspace_invoke).
+    """
+    tools = _tools_by_name()
+    direct = _direct_groups()
+    groups = [toolset] if toolset else list(TOOLSETS)
+    if toolset and toolset not in TOOLSETS:
+        raise ValueError(
+            f"Unknown toolset '{toolset}'. Available: {', '.join(sorted(TOOLSETS))}."
+        )
+    out = {}
+    for group in groups:
+        access = "direct" if group in direct else "invoke"
+        rows = []
+        for name in TOOLSETS[group]:
+            tool = tools.get(name)
+            if tool is not None:
+                rows.append({"name": name,
+                             "summary": _first_line(tool.description),
+                             "access": access})
+        out[group] = rows
+    return {"toolsets": out,
+            "hint": "Call describe_rspace_tool([names]) for schemas, then "
+                    "rspace_invoke(tool_name, arguments) to run an 'invoke' tool."}
+
+
+@mcp.tool(tags={"rspace", "dispatcher"})
+def describe_rspace_tool(names: List[str]) -> dict:
+    """
+    Return the full input schema(s) for one or more RSpace tools.
+
+    Use before rspace_invoke to see a hidden tool's parameters. Batch several
+    names in one call to save round-trips.
+    Parameters: names - list of tool names from list_rspace_tools.
+    Returns: {tools: [{name, description, input_schema}], unknown: [names]}
+    """
+    tools = _tools_by_name()
+    found, unknown = [], []
+    for name in names:
+        tool = tools.get(name)
+        if tool is None:
+            unknown.append(name)
+            continue
+        found.append({
+            "name": name,
+            "description": tool.description or "",
+            "input_schema": tool.parameters,
+        })
+    return {"tools": found, "unknown": unknown}
+
+
+@mcp.tool(tags={"rspace", "dispatcher"})
+async def rspace_invoke(tool_name: str, arguments: dict = None) -> Any:
+    """
+    Run any RSpace tool by name, including ones not directly listed.
+
+    Validates arguments against the tool's real schema and runs the original
+    function, returning its normal result. If you are unsure of the parameters,
+    call describe_rspace_tool([tool_name]) first.
+    Parameters:
+      tool_name: the tool to run (from list_rspace_tools / describe_rspace_tool).
+      arguments: dict of arguments for that tool (omit or {} if it takes none).
+    Returns: the target tool's own return value.
+    """
+    tools = _tools_by_name()
+    if tool_name in _DISPATCHER_TOOL_NAMES:
+        raise ValueError("rspace_invoke cannot call the dispatcher tools themselves.")
+    tool = tools.get(tool_name)
+    if tool is None:
+        raise ValueError(
+            f"Unknown tool '{tool_name}'. Use list_rspace_tools to see available tools."
+        )
+    try:
+        result = await tool.run(arguments or {})
+    except Exception as exc:
+        # Surface a corrective message (e.g. schema validation) rather than
+        # failing opaquely, so the model can fix the call and retry.
+        raise ValueError(
+            f"Call to '{tool_name}' failed: {exc}. Call "
+            f"describe_rspace_tool(['{tool_name}']) to check its parameters."
+        )
+    payload = result.structured_content
+    # FastMCP wraps scalar returns as {"result": x}; unwrap for a clean value.
+    if isinstance(payload, dict) and set(payload.keys()) == {"result"}:
+        return payload["result"]
+    return payload
+
+
+def _configure_dispatcher() -> None:
+    """Tag tools by group and hide everything not in a direct group or a dispatcher."""
+    tools = _tools_by_name()
+    direct = _direct_groups()
+    ungrouped, hidden = [], 0
+    for name, tool in tools.items():
+        if name in _DISPATCHER_TOOL_NAMES:
+            tool.enable()
+            continue
+        group = _GROUP_OF.get(name)
+        if group is None:
+            # Fail open: an unmapped tool stays directly visible.
+            tool.tags.add("ungrouped")
+            tool.enable()
+            ungrouped.append(name)
+            continue
+        tool.tags.add(group)
+        if group in direct:
+            tool.enable()
+        else:
+            tool.disable()
+            hidden += 1
+    if ungrouped:
+        logger.warning("Tools not assigned to any toolset (left visible): %s",
+                       ", ".join(sorted(ungrouped)))
+    logger.info("RSpace dispatcher active. Direct groups: %s. %d tools hidden "
+                "behind rspace_invoke (set RSPACE_DIRECT_TOOLSETS to expose more).",
+                ", ".join(sorted(direct)), hidden)
+
+
+_configure_dispatcher()
+
+
+# ============================================================================
 # SERVER EXECUTION
 # ============================================================================
 # This section handles the actual MCP server startup
@@ -2232,7 +2484,9 @@ if __name__ == "__main__":
     
     Deployment:
     - Ensure RSPACE_API_KEY and RSPACE_URL environment variables are set
-    - Server will automatically expose all registered tools to MCP clients
+    - Only the core and destructive tools are listed directly; the rest are run
+      via rspace_invoke (see the TOOL DISPATCHER section). RSPACE_DIRECT_TOOLSETS
+      promotes extra groups to direct exposure.
     - Use appropriate tags for tool categorization and discovery
     """
     mcp.run()
