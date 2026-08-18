@@ -23,6 +23,7 @@ from rspace_client.eln import eln as e  # Electronic Lab Notebook client
 from rspace_client.inv import inv as i  # Inventory Management client
 from rspace_client.eln.advanced_query_builder import AdvancedQueryBuilder
 import os
+import asyncio
 import logging
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -2322,9 +2323,21 @@ _GROUP_OF: Dict[str, str] = {
 }
 
 
+# Snapshot of every registered Tool (name -> Tool), captured before any tools
+# are hidden. FastMCP 3 drops a disabled tool from get_tool()/list_tools(), so
+# the dispatcher keeps its own references to reach hidden tools when running
+# describe_rspace_tool and rspace_invoke.
+_ALL_TOOLS: Dict[str, Any] = {}
+
+
 def _tools_by_name() -> Dict[str, Any]:
-    """Live registry of Tool objects (name -> Tool)."""
-    return mcp._tool_manager._tools
+    """Registry of every registered Tool object (name -> Tool), hidden included."""
+    if not _ALL_TOOLS:
+        # list_tools() is async; safe to drive with asyncio.run here because this
+        # first population happens at import time, before any event loop is running.
+        for tool in asyncio.run(mcp.list_tools()):
+            _ALL_TOOLS[tool.name] = tool
+    return _ALL_TOOLS
 
 
 def _direct_groups() -> set:
@@ -2460,30 +2473,30 @@ def _configure_dispatcher() -> None:
     """Tag tools by group and hide everything not in a direct group or a dispatcher."""
     tools = _tools_by_name()
     direct = _direct_groups()
-    ungrouped, hidden = [], 0
+    ungrouped, hide = [], set()
     for name, tool in tools.items():
         if name in _DISPATCHER_TOOL_NAMES:
-            tool.enable()
-            continue
+            continue  # dispatcher entry points stay directly visible (enabled by default)
         group = _GROUP_OF.get(name)
         if group is None:
             # Fail open: an unmapped tool stays directly visible.
             tool.tags.add("ungrouped")
-            tool.enable()
             ungrouped.append(name)
             continue
         tool.tags.add(group)
-        if group in direct:
-            tool.enable()
-        else:
-            tool.disable()
-            hidden += 1
+        if group not in direct:
+            hide.add(name)
+    if hide:
+        # FastMCP 3: hide these from the client's tool list in a single call.
+        # They stay registered and remain runnable through the references held
+        # in _ALL_TOOLS, which is what rspace_invoke / describe_rspace_tool use.
+        mcp.disable(names=hide)
     if ungrouped:
         logger.warning("Tools not assigned to any toolset (left visible): %s",
                        ", ".join(sorted(ungrouped)))
     logger.info("RSpace dispatcher active. Direct groups: %s. %d tools hidden "
                 "behind rspace_invoke (set RSPACE_DIRECT_TOOLSETS to expose more).",
-                ", ".join(sorted(direct)), hidden)
+                ", ".join(sorted(direct)), len(hide))
 
 
 _configure_dispatcher()
